@@ -1,0 +1,142 @@
+package core
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/bytedance/sonic"
+	"github.com/valyala/fasthttp"
+)
+
+// RequestHandler 定义HTTP请求处理器接口
+type RequestHandler func(*RequestContext)
+
+// Middleware 定义中间件接口
+type Middleware func(fasthttp.RequestHandler) fasthttp.RequestHandler
+
+// RequestContext 扩展fasthttp.RequestCtx，提供更友好的API
+type RequestContext struct {
+	*fasthttp.RequestCtx
+	app       *App
+	params    map[string]string
+	startTime time.Time
+}
+
+// GetParam 获取路径参数
+func (c *RequestContext) GetParam(key string) string {
+	return c.params[key]
+}
+
+// SetParam 设置路径参数
+func (c *RequestContext) SetParam(key, value string) {
+	c.params[key] = value
+}
+
+// JSON 发送JSON响应
+func (c *RequestContext) JSON(statusCode int, data interface{}) error {
+	c.SetStatusCode(statusCode)
+	c.SetContentType("application/json")
+
+	// 使用sonic进行JSON序列化
+	jsonData, err := sonic.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	c.SetBody(jsonData)
+	return nil
+}
+
+// BindJSON 绑定JSON请求体到结构体
+func (c *RequestContext) BindJSON(v interface{}) error {
+	return sonic.Unmarshal(c.PostBody(), v)
+}
+
+// String 发送字符串响应
+func (c *RequestContext) String(statusCode int, format string, args ...interface{}) {
+	c.SetStatusCode(statusCode)
+	c.SetContentType("text/plain; charset=utf-8")
+	c.SetBodyString(fmt.Sprintf(format, args...))
+}
+
+// HTML 发送HTML响应
+func (c *RequestContext) HTML(statusCode int, html string) {
+	c.SetStatusCode(statusCode)
+	c.SetContentType("text/html; charset=utf-8")
+	c.SetBodyString(html)
+}
+
+// Redirect 重定向
+func (c *RequestContext) Redirect(statusCode int, url string) {
+	c.Response.Header.Set("Location", url)
+	c.SetStatusCode(statusCode)
+}
+
+// GetHeader 获取请求头
+func (c *RequestContext) GetHeader(key string) string {
+	return string(c.Request.Header.Peek(key))
+}
+
+// SetHeader 设置响应头
+func (c *RequestContext) SetHeader(key, value string) {
+	c.Response.Header.Set(key, value)
+}
+
+// GetQuery 获取查询参数
+func (c *RequestContext) GetQuery(key string) string {
+	return string(c.QueryArgs().Peek(key))
+}
+
+// GetForm 获取表单参数
+func (c *RequestContext) GetForm(key string) string {
+	return string(c.FormValue(key))
+}
+
+// RouterGroup 路由组，用于组织相关路由
+type RouterGroup struct {
+	app    *App
+	prefix string
+}
+
+// GET 在路由组中注册GET路由
+func (g *RouterGroup) GET(path string, handler RequestHandler) {
+	g.app.router.GET(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// POST 在路由组中注册POST路由
+func (g *RouterGroup) POST(path string, handler RequestHandler) {
+	g.app.router.POST(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// PUT 在路由组中注册PUT路由
+func (g *RouterGroup) PUT(path string, handler RequestHandler) {
+	g.app.router.PUT(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// DELETE 在路由组中注册DELETE路由
+func (g *RouterGroup) DELETE(path string, handler RequestHandler) {
+	g.app.router.DELETE(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// PATCH 在路由组中注册PATCH路由
+func (g *RouterGroup) PATCH(path string, handler RequestHandler) {
+	g.app.router.PATCH(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// HEAD 在路由组中注册HEAD路由
+func (g *RouterGroup) HEAD(path string, handler RequestHandler) {
+	g.app.router.HEAD(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// OPTIONS 在路由组中注册OPTIONS路由
+func (g *RouterGroup) OPTIONS(path string, handler RequestHandler) {
+	g.app.router.OPTIONS(g.prefix+path, g.app.wrapHandler(handler))
+}
+
+// Group 创建子路由组
+func (g *RouterGroup) Group(prefix string) *RouterGroup {
+	return &RouterGroup{
+		app:    g.app,
+		prefix: g.prefix + prefix,
+	}
+}
