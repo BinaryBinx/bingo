@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -75,10 +76,11 @@ func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Re
 
 	// 创建连接包装器
 	connection := &Connection{
-		conn:    conn,
-		manager: w.manager,
-		id:      generateID(),
-		ctx:     request.Context(),
+		conn:         conn,
+		manager:      w.manager,
+		id:           generateID(),
+		ctx:          request.Context(),
+		lastActivity: time.Now(),
 	}
 
 	// 添加到连接管理器
@@ -94,12 +96,13 @@ func (w *WebSocketUpgrader) GetManager() *ConnectionManager {
 
 // Connection WebSocket连接包装器
 type Connection struct {
-	conn    *websocket.Conn
-	manager *ConnectionManager
-	id      string
-	ctx     context.Context
-	mu      sync.RWMutex
-	closed  bool
+	conn         *websocket.Conn
+	manager      *ConnectionManager
+	id           string
+	ctx          context.Context
+	mu           sync.RWMutex
+	closed       bool
+	lastActivity time.Time
 }
 
 // ID 获取连接ID
@@ -109,60 +112,80 @@ func (c *Connection) ID() string {
 
 // Send 发送消息
 func (c *Connection) Send(v interface{}) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return wsjson.Write(c.ctx, c.conn, v)
 }
 
 // SendText 发送文本消息
 func (c *Connection) SendText(text string) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return c.conn.Write(c.ctx, websocket.MessageText, []byte(text))
 }
 
 // SendBinary 发送二进制消息
 func (c *Connection) SendBinary(data []byte) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return c.conn.Write(c.ctx, websocket.MessageBinary, data)
 }
 
 // Read 读取消息
 func (c *Connection) Read(v interface{}) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	return wsjson.Read(c.ctx, c.conn, v)
 }
 
 // ReadText 读取文本消息
 func (c *Connection) ReadText() (string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return "", ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	_, data, err := c.conn.Read(c.ctx)
 	if err != nil {
@@ -174,12 +197,16 @@ func (c *Connection) ReadText() (string, error) {
 
 // ReadBinary 读取二进制消息
 func (c *Connection) ReadBinary() ([]byte, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
+	c.mu.Lock()
 	if c.closed {
+		c.mu.Unlock()
 		return nil, ErrConnectionClosed
 	}
+	c.lastActivity = time.Now()
+	c.mu.Unlock()
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	_, data, err := c.conn.Read(c.ctx)
 	if err != nil {
@@ -199,6 +226,8 @@ func (c *Connection) Close() error {
 	}
 
 	c.closed = true
+	// 尝试从管理器中移除连接，但不返回错误
+	// 因为连接可能已经被清理协程移除
 	c.manager.Remove(c.id)
 	return c.conn.Close(websocket.StatusNormalClosure, "")
 }
@@ -214,13 +243,24 @@ func (c *Connection) IsClosed() bool {
 type ConnectionManager struct {
 	connections map[string]*Connection
 	mu          sync.RWMutex
+	// 连接超时时间（秒）
+	timeout int
+	// 最大连接数
+	maxConns int
 }
 
 // NewConnectionManager 创建新的连接管理器
 func NewConnectionManager() *ConnectionManager {
-	return &ConnectionManager{
+	manager := &ConnectionManager{
 		connections: make(map[string]*Connection),
+		timeout:     3600, // 默认1小时超时
+		maxConns:    1000, // 默认最大1000个连接
 	}
+
+	// 启动连接清理协程
+	go manager.cleanupConnections()
+
+	return manager
 }
 
 // Add 添加连接
@@ -302,4 +342,69 @@ func (m *ConnectionManager) CloseAll() {
 	for _, conn := range connections {
 		conn.Close()
 	}
+}
+
+// cleanupConnections 定期清理超时的连接
+func (m *ConnectionManager) cleanupConnections() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		m.mu.Lock()
+		currentTime := time.Now()
+		timeoutDuration := time.Duration(m.timeout) * time.Second
+
+		// 收集需要清理的连接ID
+		var toCleanup []string
+		for id, conn := range m.connections {
+			conn.mu.RLock()
+			lastActivity := conn.lastActivity
+			closed := conn.closed
+			conn.mu.RUnlock()
+
+			if closed || currentTime.Sub(lastActivity) > timeoutDuration {
+				toCleanup = append(toCleanup, id)
+			}
+		}
+
+		// 先从映射中删除，再关闭连接
+		for _, id := range toCleanup {
+			conn := m.connections[id]
+			delete(m.connections, id)
+			// 在锁外关闭连接，避免死锁
+			go func(c *Connection, i string) {
+				c.Close()
+				log.Printf("WebSocket连接已超时并关闭: %s", i)
+			}(conn, id)
+		}
+		m.mu.Unlock()
+	}
+}
+
+// SetTimeout 设置连接超时时间（秒）
+func (m *ConnectionManager) SetTimeout(timeout int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.timeout = timeout
+}
+
+// SetMaxConns 设置最大连接数
+func (m *ConnectionManager) SetMaxConns(maxConns int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxConns = maxConns
+}
+
+// GetTimeout 获取连接超时时间（秒）
+func (m *ConnectionManager) GetTimeout() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.timeout
+}
+
+// GetMaxConns 获取最大连接数
+func (m *ConnectionManager) GetMaxConns() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.maxConns
 }

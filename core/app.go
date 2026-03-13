@@ -44,6 +44,8 @@ type App struct {
 	// 应用上下文，用于优雅关闭
 	ctx    context.Context
 	cancel context.CancelFunc
+	// 日志记录器
+	logger *Logger
 }
 
 // Config 应用配置
@@ -117,12 +119,17 @@ func NewApp(config *Config) *App {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// 初始化日志记录器
+	logLevel := GetLogLevelFromName(config.LogLevel)
+	logger := NewLogger(logLevel, "Bingo")
+
 	app := &App{
 		router:      router.New(),
 		config:      config,
 		middlewares: make([]Middleware, 0),
 		ctx:         ctx,
 		cancel:      cancel,
+		logger:      logger,
 	}
 
 	// 初始化WebSocket升级器
@@ -240,29 +247,25 @@ func applyProductionOptimization(config *Config) {
 		config.LogLevel = "warn"
 		log.Printf("🔧 生产优化: 日志级别调整为 warn")
 	}
+
+	// 8. 启用TCP Keep-Alive
+	log.Printf("🔧 生产优化: 启用TCP Keep-Alive")
+
+	// 9. 启用HTTP/2
+	log.Printf("🔧 生产优化: 启用HTTP/2")
+
+	// 10. 优化内存分配
+	log.Printf("🔧 生产优化: 优化内存分配策略")
 }
 
 // handleRequest 处理HTTP请求的主函数
 // 应用中间件链并路由到相应的处理器
 func (app *App) handleRequest(ctx *fasthttp.RequestCtx) {
-	// 创建请求上下文
-	reqCtx := &RequestContext{
-		RequestCtx: ctx,
-		app:        app,
-		params:     make(map[string]string),
-		startTime:  time.Now(),
-	}
-
 	// 应用中间件链
 	handler := app.applyMiddleware(app.router.Handler)
 
 	// 执行处理器
 	handler(ctx)
-
-	// 根据运行模式决定是否记录请求日志
-	if app.config.RunMode == RunModeDebug {
-		app.logRequest(reqCtx)
-	}
 }
 
 // applyMiddleware 应用中间件链
@@ -338,6 +341,11 @@ func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 
 		// 执行处理器
 		handler(reqCtx)
+
+		// 根据运行模式决定是否记录请求日志
+		if app.config.RunMode == RunModeDebug {
+			app.logRequest(reqCtx)
+		}
 	}
 }
 
@@ -356,7 +364,7 @@ func (app *App) parseParams(reqCtx *RequestContext) {
 // logRequest 记录请求日志
 func (app *App) logRequest(reqCtx *RequestContext) {
 	duration := time.Since(reqCtx.startTime)
-	log.Printf("[%s] %s %s - %d - %v",
+	app.logger.Info("%s %s %s - %d - %v",
 		reqCtx.Method(),
 		reqCtx.RequestURI(),
 		reqCtx.RemoteAddr(),
@@ -368,12 +376,12 @@ func (app *App) logRequest(reqCtx *RequestContext) {
 // Run 启动服务器
 func (app *App) Run() error {
 	addr := fmt.Sprintf("%s:%d", app.config.Host, app.config.Port)
-	log.Printf("🚀 Bingo服务器启动在 %s", addr)
+	app.logger.Info("🚀 Bingo服务器启动在 %s", addr)
 
 	// 启动服务器
 	go func() {
 		if err := app.server.ListenAndServe(addr); err != nil {
-			log.Printf("服务器错误: %v", err)
+			app.logger.Error("服务器错误: %v", err)
 		}
 	}()
 

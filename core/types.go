@@ -14,6 +14,30 @@ type RequestHandler func(*RequestContext)
 // Middleware 定义中间件接口
 type Middleware func(fasthttp.RequestHandler) fasthttp.RequestHandler
 
+// MiddlewareFunc 定义中间件函数类型
+type MiddlewareFunc func(*RequestContext) bool
+
+// NewMiddleware 从MiddlewareFunc创建Middleware
+func NewMiddleware(fn MiddlewareFunc) Middleware {
+	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+		return func(ctx *fasthttp.RequestCtx) {
+			// 注意：这里的RequestContext没有设置app字段，因为中间件是独立的
+			// 在实际使用中，app字段会在wrapHandler中被正确设置
+			reqCtx := &RequestContext{
+				RequestCtx: ctx,
+				params:     make(map[string]string),
+				startTime:  time.Now(),
+			}
+
+			// 执行中间件函数
+			if fn(reqCtx) {
+				// 如果中间件返回true，继续执行下一个处理器
+				next(ctx)
+			}
+		}
+	}
+}
+
 // RequestContext 扩展fasthttp.RequestCtx，提供更友好的API
 type RequestContext struct {
 	*fasthttp.RequestCtx
