@@ -10,7 +10,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zjxubinbin/bingo/websocket"
+	"github.com/BinaryBinx/bingo/websocket"
 
 	"github.com/fasthttp/router"
 	"github.com/valyala/fasthttp"

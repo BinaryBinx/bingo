@@ -6,7 +6,7 @@ import (
 	"runtime"
 	"strconv"
 
-	"github.com/zjxubinbin/bingo/core"
+	"github.com/BinaryBinx/bingo/core"
 )
 
 func main() {

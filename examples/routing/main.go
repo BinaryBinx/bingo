@@ -5,7 +5,7 @@ import (
 	"log"
 	"strconv"
 
-	"github.com/zjxubinbin/bingo/core"
+	"github.com/BinaryBinx/bingo/core"
 )
 
 // User 用户结构体

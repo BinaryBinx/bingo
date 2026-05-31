@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	"github.com/zjxubinbin/bingo/core"
-	"github.com/zjxubinbin/bingo/middleware"
+	"github.com/BinaryBinx/bingo/core"
+	"github.com/BinaryBinx/bingo/middleware"
 )
 
 func main() {

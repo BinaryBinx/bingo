@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zjxubinbin/bingo/core"
-	"github.com/zjxubinbin/bingo/middleware"
-	"github.com/zjxubinbin/bingo/websocket"
+	"github.com/BinaryBinx/bingo/core"
+	"github.com/BinaryBinx/bingo/middleware"
+	"github.com/BinaryBinx/bingo/websocket"
 
 	"github.com/valyala/fasthttp"
 )
