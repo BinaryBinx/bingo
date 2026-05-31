@@ -1,7 +1,8 @@
 package middleware
 
 import (
-	"context"
+	"bytes"
+	"compress/gzip"
 	"fmt"
 	"log"
 	"os"
@@ -92,16 +93,21 @@ func Recovery() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 // RateLimit 限流中间件（简单实现）
 func RateLimit(requestsPerSecond int) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
-	// 这里使用简单的令牌桶算法
-	tokens := make(chan struct{}, requestsPerSecond)
+	tokens := make(chan struct{}, requestsPerSecond*2)
 	ticker := time.NewTicker(time.Second / time.Duration(requestsPerSecond))
+	stopCh := make(chan struct{})
 
-	// 定期添加令牌
 	go func() {
-		for range ticker.C {
+		for {
 			select {
-			case tokens <- struct{}{}:
-			default:
+			case <-ticker.C:
+				select {
+				case tokens <- struct{}{}:
+				default:
+				}
+			case <-stopCh:
+				ticker.Stop()
+				return
 			}
 		}
 	}()
@@ -172,11 +178,11 @@ func generateRequestID() string {
 
 // Cache 缓存中间件
 func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
-	// 简单的内存缓存实现
 	type cacheItem struct {
-		body    []byte
-		headers map[string]string
-		time    time.Time
+		body       []byte
+		statusCode int
+		headers    map[string]string
+		time       time.Time
 	}
 
 	cache := make(map[string]cacheItem)
@@ -184,22 +190,19 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 只缓存GET请求
 			if string(ctx.Method()) != "GET" {
 				next(ctx)
 				return
 			}
 
-			// 生成缓存键
 			key := string(ctx.RequestURI())
 
-			// 检查缓存
 			cacheMu.RLock()
 			item, found := cache[key]
 			cacheMu.RUnlock()
 
 			if found && time.Since(item.time) < duration {
-				// 命中缓存
+				ctx.Response.SetStatusCode(item.statusCode)
 				ctx.Response.SetBody(item.body)
 				for k, v := range item.headers {
 					ctx.Response.Header.Set(k, v)
@@ -208,21 +211,23 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 				return
 			}
 
-			// 未命中缓存，执行下一个处理器
 			next(ctx)
 
-			// 缓存响应
 			if ctx.Response.StatusCode() == fasthttp.StatusOK {
 				headers := make(map[string]string)
 				ctx.Response.Header.VisitAll(func(key, value []byte) {
 					headers[string(key)] = string(value)
 				})
 
+				bodyCopy := make([]byte, len(ctx.Response.Body()))
+				copy(bodyCopy, ctx.Response.Body())
+
 				cacheMu.Lock()
 				cache[key] = cacheItem{
-					body:    ctx.Response.Body(),
-					headers: headers,
-					time:    time.Now(),
+					body:       bodyCopy,
+					statusCode: ctx.Response.StatusCode(),
+					headers:    headers,
+					time:       time.Now(),
 				}
 				cacheMu.Unlock()
 
@@ -234,18 +239,36 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 
 // Compress 压缩中间件
 func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	var gzipPool sync.Pool
+	gzipPool.New = func() interface{} {
+		return gzip.NewWriter(nil)
+	}
+
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 执行下一个处理器
+			acceptEncoding := string(ctx.Request.Header.Peek("Accept-Encoding"))
+			if !strings.Contains(acceptEncoding, "gzip") {
+				next(ctx)
+				return
+			}
+
 			next(ctx)
 
-			// 检查是否需要压缩
-			acceptEncoding := string(ctx.Request.Header.Peek("Accept-Encoding"))
-			if strings.Contains(acceptEncoding, "gzip") {
-				// 压缩响应体
-				ctx.Response.Header.Set("Content-Encoding", "gzip")
-				ctx.Response.Header.Del("Content-Length")
+			body := ctx.Response.Body()
+			if len(body) < 256 {
+				return
 			}
+
+			var buf bytes.Buffer
+			w := gzipPool.Get().(*gzip.Writer)
+			w.Reset(&buf)
+			w.Write(body)
+			w.Close()
+			gzipPool.Put(w)
+
+			ctx.Response.SetBody(buf.Bytes())
+			ctx.Response.Header.Set("Content-Encoding", "gzip")
+			ctx.Response.Header.Del("Content-Length")
 		}
 	}
 }
@@ -271,20 +294,17 @@ func Security() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 创建带超时的上下文
-			timeoutCtx, cancel := context.WithTimeout(context.Background(), duration)
-			defer cancel()
+			done := make(chan struct{}, 1)
 
-			// 执行下一个处理器
-			next(ctx)
+			go func() {
+				next(ctx)
+				close(done)
+			}()
 
-			// 检查是否超时
 			select {
-			case <-timeoutCtx.Done():
-				ctx.SetStatusCode(fasthttp.StatusRequestTimeout)
-				ctx.SetBodyString("Request timeout")
-			default:
-				// 未超时，正常返回
+			case <-done:
+			case <-time.After(duration):
+				ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
 			}
 		}
 	}

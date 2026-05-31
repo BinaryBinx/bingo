@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,21 +32,18 @@ const (
 // App 是Bingo框架的核心应用结构
 // 负责管理HTTP服务器、路由、中间件和WebSocket连接
 type App struct {
-	// HTTP服务器实例
-	server *fasthttp.Server
-	// 路由管理器
-	router *router.Router
-	// 服务器配置
-	config *Config
-	// 中间件链
+	server      *fasthttp.Server
+	router      *router.Router
+	config      *Config
 	middlewares []Middleware
-	// WebSocket升级器
-	wsUpgrader *websocket.WebSocketUpgrader
-	// 应用上下文，用于优雅关闭
-	ctx    context.Context
-	cancel context.CancelFunc
-	// 日志记录器
-	logger *Logger
+	wsUpgrader  *websocket.WebSocketUpgrader
+	ctx         context.Context
+	cancel      context.CancelFunc
+	logger      *Logger
+
+	mu             sync.RWMutex
+	cachedHandler  fasthttp.RequestHandler
+	handlerDirty   bool
 }
 
 // Config 应用配置
@@ -131,6 +129,9 @@ func NewApp(config *Config) *App {
 		cancel:      cancel,
 		logger:      logger,
 	}
+
+	app.cachedHandler = app.applyMiddleware(app.router.Handler)
+	app.handlerDirty = false
 
 	// 初始化WebSocket升级器
 	app.wsUpgrader = websocket.NewWebSocketUpgrader(nil)
@@ -261,16 +262,25 @@ func applyProductionOptimization(config *Config) {
 // handleRequest 处理HTTP请求的主函数
 // 应用中间件链并路由到相应的处理器
 func (app *App) handleRequest(ctx *fasthttp.RequestCtx) {
-	// 应用中间件链
-	handler := app.applyMiddleware(app.router.Handler)
+	app.mu.RLock()
+	if app.handlerDirty {
+		app.mu.RUnlock()
+		app.mu.Lock()
+		if app.handlerDirty {
+			app.cachedHandler = app.applyMiddleware(app.router.Handler)
+			app.handlerDirty = false
+		}
+		app.mu.Unlock()
+		app.mu.RLock()
+	}
+	handler := app.cachedHandler
+	app.mu.RUnlock()
 
-	// 执行处理器
 	handler(ctx)
 }
 
 // applyMiddleware 应用中间件链
 func (app *App) applyMiddleware(handler fasthttp.RequestHandler) fasthttp.RequestHandler {
-	// 从后往前应用中间件
 	for i := len(app.middlewares) - 1; i >= 0; i-- {
 		handler = app.middlewares[i](handler)
 	}
@@ -279,7 +289,10 @@ func (app *App) applyMiddleware(handler fasthttp.RequestHandler) fasthttp.Reques
 
 // Use 添加中间件到应用
 func (app *App) Use(middleware Middleware) {
+	app.mu.Lock()
 	app.middlewares = append(app.middlewares, middleware)
+	app.handlerDirty = true
+	app.mu.Unlock()
 }
 
 // GET 注册GET路由
@@ -325,37 +338,56 @@ func (app *App) Group(prefix string) *RouterGroup {
 	}
 }
 
+var requestContextPool = sync.Pool{
+	New: func() interface{} {
+		return &RequestContext{
+			params: make(map[string]string),
+		}
+	},
+}
+
 // wrapHandler 包装请求处理器
 func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
-		// 创建请求上下文
-		reqCtx := &RequestContext{
-			RequestCtx: ctx,
-			app:        app,
-			params:     make(map[string]string),
-			startTime:  time.Now(),
+		reqCtx := requestContextPool.Get().(*RequestContext)
+		reqCtx.RequestCtx = ctx
+		reqCtx.app = app
+		reqCtx.startTime = time.Now()
+
+		for k := range reqCtx.params {
+			delete(reqCtx.params, k)
 		}
 
-		// 解析URL参数
 		app.parseParams(reqCtx)
 
-		// 执行处理器
-		handler(reqCtx)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					reqCtx.SetStatusCode(500)
+					reqCtx.SetBodyString("Internal Server Error")
+					app.logger.Error("panic recovered in handler: %v", r)
+				}
+			}()
+			handler(reqCtx)
+		}()
 
-		// 根据运行模式决定是否记录请求日志
 		if app.config.RunMode == RunModeDebug {
 			app.logRequest(reqCtx)
 		}
+
+		requestContextPool.Put(reqCtx)
 	}
 }
 
 // parseParams 解析URL参数
 func (app *App) parseParams(reqCtx *RequestContext) {
-	// 兼容fasthttp/router的路径参数
 	if ctx := reqCtx.RequestCtx; ctx != nil {
 		ctx.VisitUserValues(func(key []byte, value interface{}) {
-			if strValue, ok := value.(string); ok {
-				reqCtx.params[string(key)] = strValue
+			switch v := value.(type) {
+			case string:
+				reqCtx.params[string(key)] = v
+			case []byte:
+				reqCtx.params[string(key)] = string(v)
 			}
 		})
 	}

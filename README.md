@@ -1,12 +1,12 @@
 # Bingo 高性能Go Web框架
 
-Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/router](https://github.com/fasthttp/router)、[sonic](https://github.com/bytedance/sonic) 以及 [nhooyr/websocket](https://github.com/nhooyr/websocket) 构建的高性能Web框架，适合构建高并发、低延迟的API服务和WebSocket应用。
+Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/router](https://github.com/fasthttp/router)、[sonic](https://github.com/bytedance/sonic) 以及 [coder/websocket](https://github.com/coder/websocket) 构建的高性能Web框架，适合构建高并发、低延迟的API服务和WebSocket应用。
 
 ## 主要特性
 - 超高性能 HTTP 服务器（fasthttp）
 - 灵活的路由系统（fasthttp/router）
 - 极速 JSON 编解码（bytedance/sonic）
-- 原生 WebSocket 支持（nhooyr/websocket）
+- 原生 WebSocket 支持（coder/websocket）
 - **多核性能优化** - 自动利用所有CPU核心
 - 支持中间件链、路由分组、优雅关机
 - 代码结构清晰，易于扩展
@@ -35,7 +35,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 - github.com/valyala/fasthttp
 - github.com/fasthttp/router
 - github.com/bytedance/sonic
-- nhooyr.io/websocket
+- coder.io/websocket
 
 ## 快速开始
 

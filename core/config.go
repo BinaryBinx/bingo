@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // LoadConfig 从文件加载配置
@@ -64,13 +66,18 @@ func SaveConfig(config *Config, filePath string) error {
 
 // LoadConfigFromEnv 从环境变量加载配置
 func LoadConfigFromEnv(config *Config) error {
-	// 从环境变量加载配置
+	if config == nil {
+		return nil
+	}
+
 	if host := os.Getenv("BINGO_HOST"); host != "" {
 		config.Host = host
 	}
 
 	if port := os.Getenv("BINGO_PORT"); port != "" {
-		// 这里可以添加端口解析逻辑
+		if p, err := strconv.Atoi(port); err == nil {
+			config.Port = p
+		}
 	}
 
 	if runMode := os.Getenv("BINGO_RUN_MODE"); runMode != "" {
@@ -79,6 +86,34 @@ func LoadConfigFromEnv(config *Config) error {
 
 	if logLevel := os.Getenv("BINGO_LOG_LEVEL"); logLevel != "" {
 		config.LogLevel = logLevel
+	}
+
+	if readTimeout := os.Getenv("BINGO_READ_TIMEOUT"); readTimeout != "" {
+		if t, err := strconv.Atoi(readTimeout); err == nil {
+			config.ReadTimeout = time.Duration(t) * time.Second
+		}
+	}
+
+	if writeTimeout := os.Getenv("BINGO_WRITE_TIMEOUT"); writeTimeout != "" {
+		if t, err := strconv.Atoi(writeTimeout); err == nil {
+			config.WriteTimeout = time.Duration(t) * time.Second
+		}
+	}
+
+	if idleTimeout := os.Getenv("BINGO_IDLE_TIMEOUT"); idleTimeout != "" {
+		if t, err := strconv.Atoi(idleTimeout); err == nil {
+			config.IdleTimeout = time.Duration(t) * time.Second
+		}
+	}
+
+	if maxBodySize := os.Getenv("BINGO_MAX_BODY_SIZE"); maxBodySize != "" {
+		if s, err := strconv.Atoi(maxBodySize); err == nil {
+			config.MaxRequestBodySize = s
+		}
+	}
+
+	if serverName := os.Getenv("BINGO_SERVER_NAME"); serverName != "" {
+		config.ServerName = serverName
 	}
 
 	return nil

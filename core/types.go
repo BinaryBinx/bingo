@@ -46,6 +46,16 @@ type RequestContext struct {
 	startTime time.Time
 }
 
+// SetApp 设置关联的应用实例
+func (c *RequestContext) SetApp(app *App) {
+	c.app = app
+}
+
+// App 获取关联的应用实例
+func (c *RequestContext) App() *App {
+	return c.app
+}
+
 // GetParam 获取路径参数
 func (c *RequestContext) GetParam(key string) string {
 	return c.params[key]
