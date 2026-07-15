@@ -162,3 +162,46 @@ func TestConfig(t *testing.T) {
 		t.Errorf("Expected default log level %s, got %s", "info", config.LogLevel)
 	}
 }
+
+func TestNewAppNormalizesInvalidConfig(t *testing.T) {
+	config := &Config{
+		Host:               "",
+		Port:               -1,
+		ReadTimeout:        -1,
+		WriteTimeout:       -1,
+		IdleTimeout:        -1,
+		MaxRequestBodySize: 0,
+		RunMode:            RunMode("invalid"),
+		LogLevel:           "nope",
+		MultiCore: MultiCoreConfig{
+			Enabled:         true,
+			NumCPU:          -1,
+			WorkersPerCore:  0,
+			MaxConns:        -10,
+			ReadBufferSize:  0,
+			WriteBufferSize: 0,
+		},
+	}
+
+	app := NewApp(config)
+	defaults := DefaultConfig()
+
+	if app.GetConfig().Host != defaults.Host {
+		t.Errorf("Expected normalized host %s, got %s", defaults.Host, app.GetConfig().Host)
+	}
+	if app.GetConfig().Port != defaults.Port {
+		t.Errorf("Expected normalized port %d, got %d", defaults.Port, app.GetConfig().Port)
+	}
+	if app.GetConfig().ReadTimeout != defaults.ReadTimeout {
+		t.Errorf("Expected normalized read timeout %v, got %v", defaults.ReadTimeout, app.GetConfig().ReadTimeout)
+	}
+	if app.GetRunMode() != defaults.RunMode {
+		t.Errorf("Expected normalized run mode %s, got %s", defaults.RunMode, app.GetRunMode())
+	}
+	if app.GetLogLevel() != defaults.LogLevel {
+		t.Errorf("Expected normalized log level %s, got %s", defaults.LogLevel, app.GetLogLevel())
+	}
+	if app.GetMultiCoreConfig().MaxConns != defaults.MultiCore.MaxConns {
+		t.Errorf("Expected normalized max conns %d, got %d", defaults.MultiCore.MaxConns, app.GetMultiCoreConfig().MaxConns)
+	}
+}

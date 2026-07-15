@@ -30,6 +30,10 @@ type Config struct {
 	ReadTimeout int
 	// 写入超时时间
 	WriteTimeout int
+	// 是否跳过Origin校验。仅在明确需要允许任意跨域WebSocket时开启
+	InsecureSkipVerify bool
+	// 允许的Origin主机或 scheme://host 模式
+	OriginPatterns []string
 }
 
 // DefaultConfig 返回默认配置
@@ -57,12 +61,13 @@ func NewWebSocketUpgrader(config *Config) *WebSocketUpgrader {
 // Upgrade 升级HTTP连接到WebSocket
 func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Request) (*Connection, error) {
 	options := &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: w.config.InsecureSkipVerify,
+		OriginPatterns:     w.config.OriginPatterns,
 		CompressionMode:    websocket.CompressionDisabled,
 	}
 
 	if w.config.EnableCompression {
-		options.CompressionMode = websocket.CompressionContextTakeover
+		options.CompressionMode = websocket.CompressionNoContextTakeover
 	}
 
 	conn, err := websocket.Accept(writer, request, options)
@@ -72,12 +77,16 @@ func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Re
 
 	conn.SetReadLimit(w.config.MaxMessageSize)
 
+	connCtx, cancel := context.WithCancel(context.Background())
 	connection := &Connection{
 		conn:         conn,
 		manager:      w.manager,
 		id:           generateID(),
-		ctx:          request.Context(),
+		ctx:          connCtx,
+		cancel:       cancel,
 		lastActivity: time.Now(),
+		readTimeout:  secondsToDuration(w.config.ReadTimeout),
+		writeTimeout: secondsToDuration(w.config.WriteTimeout),
 	}
 
 	if !w.manager.Add(connection) {
@@ -99,9 +108,14 @@ type Connection struct {
 	manager      *ConnectionManager
 	id           string
 	ctx          context.Context
+	cancel       context.CancelFunc
 	mu           sync.RWMutex
+	readMu       sync.Mutex
+	writeMu      sync.Mutex
 	closed       bool
 	lastActivity time.Time
+	readTimeout  time.Duration
+	writeTimeout time.Duration
 }
 
 // ID 获取连接ID
@@ -119,10 +133,12 @@ func (c *Connection) Send(v interface{}) error {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	return wsjson.Write(c.ctx, c.conn, v)
+	ctx, cancel := c.operationContext(c.writeTimeout)
+	defer cancel()
+	return wsjson.Write(ctx, c.conn, v)
 }
 
 // SendText 发送文本消息
@@ -135,10 +151,12 @@ func (c *Connection) SendText(text string) error {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	return c.conn.Write(c.ctx, websocket.MessageText, []byte(text))
+	ctx, cancel := c.operationContext(c.writeTimeout)
+	defer cancel()
+	return c.conn.Write(ctx, websocket.MessageText, []byte(text))
 }
 
 // SendBinary 发送二进制消息
@@ -151,10 +169,12 @@ func (c *Connection) SendBinary(data []byte) error {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	return c.conn.Write(c.ctx, websocket.MessageBinary, data)
+	ctx, cancel := c.operationContext(c.writeTimeout)
+	defer cancel()
+	return c.conn.Write(ctx, websocket.MessageBinary, data)
 }
 
 // Read 读取消息
@@ -167,10 +187,12 @@ func (c *Connection) Read(v interface{}) error {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 
-	return wsjson.Read(c.ctx, c.conn, v)
+	ctx, cancel := c.operationContext(c.readTimeout)
+	defer cancel()
+	return wsjson.Read(ctx, c.conn, v)
 }
 
 // ReadText 读取文本消息
@@ -183,10 +205,12 @@ func (c *Connection) ReadText() (string, error) {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 
-	_, data, err := c.conn.Read(c.ctx)
+	ctx, cancel := c.operationContext(c.readTimeout)
+	defer cancel()
+	_, data, err := c.conn.Read(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -204,10 +228,12 @@ func (c *Connection) ReadBinary() ([]byte, error) {
 	c.lastActivity = time.Now()
 	c.mu.Unlock()
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
 
-	_, data, err := c.conn.Read(c.ctx)
+	ctx, cancel := c.operationContext(c.readTimeout)
+	defer cancel()
+	_, data, err := c.conn.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +251,7 @@ func (c *Connection) Close() error {
 	}
 
 	c.closed = true
+	c.cancel()
 	// 尝试从管理器中移除连接，但不返回错误
 	// 因为连接可能已经被清理协程移除
 	c.manager.Remove(c.id)
@@ -236,6 +263,20 @@ func (c *Connection) IsClosed() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.closed
+}
+
+func (c *Connection) operationContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return c.ctx, func() {}
+	}
+	return context.WithTimeout(c.ctx, timeout)
+}
+
+func secondsToDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // ConnectionManager 连接管理器

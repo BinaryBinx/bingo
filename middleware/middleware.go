@@ -5,10 +5,14 @@ import (
 	"compress/gzip"
 	"fmt"
 	"log"
+	"mime"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -38,13 +42,35 @@ func Logger() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 // CORS 跨域中间件
 func CORS(allowedOrigins []string, allowedMethods []string, allowedHeaders []string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	originAllowed := func(origin string) bool {
+		for _, allowedOrigin := range allowedOrigins {
+			if allowedOrigin == "*" || allowedOrigin == origin {
+				return true
+			}
+		}
+		return false
+	}
+
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 检查是否允许该源
-			if len(allowedOrigins) > 0 {
-				ctx.Response.Header.Set("Access-Control-Allow-Origin", strings.Join(allowedOrigins, ", "))
-			} else {
+			origin := string(ctx.Request.Header.Peek("Origin"))
+			allowCredentials := false
+
+			switch {
+			case len(allowedOrigins) == 0:
 				ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+			case origin != "" && originAllowed(origin):
+				for _, allowedOrigin := range allowedOrigins {
+					if allowedOrigin == "*" {
+						ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+						break
+					}
+				}
+				if string(ctx.Response.Header.Peek("Access-Control-Allow-Origin")) == "" {
+					ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+					ctx.Response.Header.Set("Vary", "Origin")
+					allowCredentials = true
+				}
 			}
 
 			// 设置其他CORS头
@@ -60,7 +86,9 @@ func CORS(allowedOrigins []string, allowedMethods []string, allowedHeaders []str
 				ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 			}
 
-			ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+			if allowCredentials {
+				ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+			}
 			ctx.Response.Header.Set("Access-Control-Max-Age", "86400")
 
 			// 处理预检请求
@@ -93,7 +121,20 @@ func Recovery() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 // RateLimit 限流中间件（简单实现）
 func RateLimit(requestsPerSecond int) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
-	tokens := make(chan struct{}, requestsPerSecond*2)
+	if requestsPerSecond <= 0 {
+		return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+			return func(ctx *fasthttp.RequestCtx) {
+				next(ctx)
+			}
+		}
+	}
+
+	burst := requestsPerSecond * 2
+	tokens := make(chan struct{}, burst)
+	for i := 0; i < burst; i++ {
+		tokens <- struct{}{}
+	}
+
 	ticker := time.NewTicker(time.Second / time.Duration(requestsPerSecond))
 	stopCh := make(chan struct{})
 
@@ -169,11 +210,12 @@ func RequestID() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	}
 }
 
+var requestIDCounter uint64
+
 // generateRequestID 生成请求ID
 func generateRequestID() string {
-	// 这里可以使用UUID或其他方式生成唯一ID
-	// 简单实现使用时间戳
-	return fmt.Sprintf("req_%d", time.Now().UnixNano())
+	id := atomic.AddUint64(&requestIDCounter, 1)
+	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), id)
 }
 
 // Cache 缓存中间件
@@ -255,19 +297,29 @@ func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 			next(ctx)
 
 			body := ctx.Response.Body()
-			if len(body) < 256 {
+			statusCode := ctx.Response.StatusCode()
+			if len(body) < 256 || statusCode == fasthttp.StatusNoContent || statusCode == fasthttp.StatusNotModified ||
+				len(ctx.Response.Header.Peek("Content-Encoding")) > 0 {
 				return
 			}
 
 			var buf bytes.Buffer
 			w := gzipPool.Get().(*gzip.Writer)
 			w.Reset(&buf)
-			w.Write(body)
-			w.Close()
+			if _, err := w.Write(body); err != nil {
+				w.Close()
+				gzipPool.Put(w)
+				return
+			}
+			if err := w.Close(); err != nil {
+				gzipPool.Put(w)
+				return
+			}
 			gzipPool.Put(w)
 
 			ctx.Response.SetBody(buf.Bytes())
 			ctx.Response.Header.Set("Content-Encoding", "gzip")
+			ctx.Response.Header.Set("Vary", "Accept-Encoding")
 			ctx.Response.Header.Del("Content-Length")
 		}
 	}
@@ -293,38 +345,100 @@ func Security() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 // Timeout 超时中间件
 func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-		return func(ctx *fasthttp.RequestCtx) {
-			done := make(chan struct{}, 1)
-
-			go func() {
-				next(ctx)
-				close(done)
-			}()
-
-			select {
-			case <-done:
-			case <-time.After(duration):
-				ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-			}
+		if duration <= 0 {
+			return next
 		}
+		return fasthttp.TimeoutHandler(next, duration, "Request timeout")
 	}
 }
 
 // Static 静态文件中间件
 func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	const maxCacheableStaticFileSize = 1 << 20
+
+	type staticCacheItem struct {
+		body        []byte
+		contentType string
+		modTime     time.Time
+		size        int64
+	}
+
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		rootAbs = filepath.Clean(root)
+	}
+	rootAbs = filepath.Clean(rootAbs)
+	rootPrefix := rootAbs + string(os.PathSeparator)
+	cache := make(map[string]staticCacheItem)
+	cacheMu := sync.RWMutex{}
+
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 构建文件路径
-			path := string(ctx.RequestURI())
-			if path == "/" {
-				path = "/index.html"
+			requestPath, err := url.PathUnescape(string(ctx.Path()))
+			if err != nil {
+				ctx.Error("Bad Request", fasthttp.StatusBadRequest)
+				return
 			}
-			filePath := filepath.Join(root, path)
+			requestPath = strings.ReplaceAll(requestPath, "\\", "/")
+			cleanPath := path.Clean("/" + requestPath)
+			if cleanPath == "/" {
+				cleanPath = "/index.html"
+			}
+
+			relPath := strings.TrimPrefix(cleanPath, "/")
+			filePath := filepath.Join(rootAbs, filepath.FromSlash(relPath))
+			fileAbs, err := filepath.Abs(filePath)
+			if err != nil {
+				ctx.Error("Bad Request", fasthttp.StatusBadRequest)
+				return
+			}
+			fileAbs = filepath.Clean(fileAbs)
+			if fileAbs != rootAbs && !strings.HasPrefix(fileAbs, rootPrefix) {
+				ctx.Error("Forbidden", fasthttp.StatusForbidden)
+				return
+			}
 
 			// 检查文件是否存在
-			if _, err := os.Stat(filePath); err == nil {
+			if info, err := os.Stat(fileAbs); err == nil && !info.IsDir() {
+				cacheable := info.Size() <= maxCacheableStaticFileSize
+				if cacheable {
+					cacheMu.RLock()
+					item, found := cache[fileAbs]
+					cacheMu.RUnlock()
+					if found && item.modTime.Equal(info.ModTime()) && item.size == info.Size() {
+						if item.contentType != "" {
+							ctx.SetContentType(item.contentType)
+						}
+						ctx.SetStatusCode(fasthttp.StatusOK)
+						ctx.SetBody(item.body)
+						return
+					}
+				}
+
 				// 服务静态文件
-				fasthttp.ServeFile(ctx, filePath)
+				data, err := os.ReadFile(fileAbs)
+				if err != nil {
+					ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+					return
+				}
+				contentType := mime.TypeByExtension(filepath.Ext(fileAbs))
+				if contentType != "" {
+					ctx.SetContentType(contentType)
+				}
+				if cacheable {
+					bodyCopy := make([]byte, len(data))
+					copy(bodyCopy, data)
+					cacheMu.Lock()
+					cache[fileAbs] = staticCacheItem{
+						body:        bodyCopy,
+						contentType: contentType,
+						modTime:     info.ModTime(),
+						size:        info.Size(),
+					}
+					cacheMu.Unlock()
+				}
+				ctx.SetStatusCode(fasthttp.StatusOK)
+				ctx.SetBody(data)
 				return
 			}
 

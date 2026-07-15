@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -41,9 +42,9 @@ type App struct {
 	cancel      context.CancelFunc
 	logger      *Logger
 
-	mu             sync.RWMutex
-	cachedHandler  fasthttp.RequestHandler
-	handlerDirty   bool
+	mu            sync.RWMutex
+	cachedHandler fasthttp.RequestHandler
+	handlerDirty  bool
 }
 
 // Config 应用配置
@@ -109,6 +110,8 @@ func NewApp(config *Config) *App {
 		config = DefaultConfig()
 	}
 
+	normalizeConfig(config)
+
 	// 应用多核性能优化
 	applyMultiCoreOptimization(config)
 
@@ -155,6 +158,66 @@ func NewApp(config *Config) *App {
 	}
 
 	return app
+}
+
+// normalizeConfig 修正不安全或无效的配置值，避免启动时出现隐式 panic 或不可预测行为。
+func normalizeConfig(config *Config) {
+	defaults := DefaultConfig()
+
+	if config.Host == "" {
+		config.Host = defaults.Host
+	}
+	if config.Port <= 0 || config.Port > 65535 {
+		config.Port = defaults.Port
+	}
+	if config.ReadTimeout < 0 {
+		config.ReadTimeout = defaults.ReadTimeout
+	}
+	if config.WriteTimeout < 0 {
+		config.WriteTimeout = defaults.WriteTimeout
+	}
+	if config.IdleTimeout < 0 {
+		config.IdleTimeout = defaults.IdleTimeout
+	}
+	if config.MaxRequestBodySize <= 0 {
+		config.MaxRequestBodySize = defaults.MaxRequestBodySize
+	}
+	if config.ServerName == "" {
+		config.ServerName = defaults.ServerName
+	}
+	switch config.RunMode {
+	case RunModeDebug, RunModeRelease, RunModeTest:
+	default:
+		config.RunMode = defaults.RunMode
+	}
+	if !isKnownLogLevel(config.LogLevel) {
+		config.LogLevel = defaults.LogLevel
+	}
+
+	if config.MultiCore.NumCPU < 0 {
+		config.MultiCore.NumCPU = defaults.MultiCore.NumCPU
+	}
+	if config.MultiCore.WorkersPerCore <= 0 {
+		config.MultiCore.WorkersPerCore = defaults.MultiCore.WorkersPerCore
+	}
+	if config.MultiCore.MaxConns <= 0 {
+		config.MultiCore.MaxConns = defaults.MultiCore.MaxConns
+	}
+	if config.MultiCore.ReadBufferSize <= 0 {
+		config.MultiCore.ReadBufferSize = defaults.MultiCore.ReadBufferSize
+	}
+	if config.MultiCore.WriteBufferSize <= 0 {
+		config.MultiCore.WriteBufferSize = defaults.MultiCore.WriteBufferSize
+	}
+}
+
+func isKnownLogLevel(name string) bool {
+	switch name {
+	case "debug", "info", "warn", "error", "fatal":
+		return true
+	default:
+		return false
+	}
 }
 
 // applyMultiCoreOptimization 应用多核性能优化
@@ -411,24 +474,37 @@ func (app *App) Run() error {
 	app.logger.Info("🚀 Bingo服务器启动在 %s", addr)
 
 	// 启动服务器
+	errCh := make(chan error, 1)
 	go func() {
 		if err := app.server.ListenAndServe(addr); err != nil {
-			app.logger.Error("服务器错误: %v", err)
+			errCh <- err
 		}
 	}()
 
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	defer signal.Stop(quit)
 
-	log.Println("🛑 正在关闭服务器...")
-	return app.Shutdown()
+	select {
+	case err := <-errCh:
+		app.cancel()
+		if errors.Is(err, fasthttp.ErrAlreadyServing) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", ErrServerStart, err)
+	case <-quit:
+		log.Println("🛑 正在关闭服务器...")
+		return app.Shutdown()
+	}
 }
 
 // Shutdown 优雅关闭服务器
 func (app *App) Shutdown() error {
 	app.cancel()
+	if app.wsUpgrader != nil {
+		app.wsUpgrader.GetManager().Shutdown()
+	}
 
 	// 设置关闭超时
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
