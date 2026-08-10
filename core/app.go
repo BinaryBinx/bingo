@@ -155,6 +155,7 @@ func NewApp(config *Config) *App {
 		NoDefaultContentType:         false,
 		Name:                         config.ServerName,
 		TCPKeepalive:                 true,
+		ReduceMemoryUsage:            true,
 		// 多核性能优化配置
 		Concurrency:     config.MultiCore.MaxConns,
 		ReadBufferSize:  config.MultiCore.ReadBufferSize,
@@ -412,8 +413,11 @@ func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 			reqCtx.startTime = time.Now()
 		}
 
-		for k := range reqCtx.params {
-			delete(reqCtx.params, k)
+		// 清理上一请求残留的路径参数；无参数时跳过空循环
+		if len(reqCtx.params) > 0 {
+			for k := range reqCtx.params {
+				delete(reqCtx.params, k)
+			}
 		}
 
 		app.parseParams(reqCtx)

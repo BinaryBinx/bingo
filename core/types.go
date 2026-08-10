@@ -28,8 +28,10 @@ func NewMiddleware(fn MiddlewareFunc) Middleware {
 			reqCtx.RequestCtx = ctx
 
 			// 清理上一请求残留的路径参数
-			for k := range reqCtx.params {
-				delete(reqCtx.params, k)
+			if len(reqCtx.params) > 0 {
+				for k := range reqCtx.params {
+					delete(reqCtx.params, k)
+				}
 			}
 
 			// 执行中间件函数
