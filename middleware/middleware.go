@@ -2,19 +2,19 @@ package middleware
 
 import (
 	"bytes"
-	"compress/gzip"
-	"fmt"
 	"log"
 	"mime"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/gzip"
 	"github.com/valyala/fasthttp"
 )
 
@@ -42,6 +42,15 @@ func Logger() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 // CORS 跨域中间件
 func CORS(allowedOrigins []string, allowedMethods []string, allowedHeaders []string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	// 预计算方法与头信息，避免每次请求重复 strings.Join
+	allowAllOrigins := false
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			allowAllOrigins = true
+			break
+		}
+	}
+
 	originAllowed := func(origin string) bool {
 		for _, allowedOrigin := range allowedOrigins {
 			if allowedOrigin == "*" || allowedOrigin == origin {
@@ -49,6 +58,16 @@ func CORS(allowedOrigins []string, allowedMethods []string, allowedHeaders []str
 			}
 		}
 		return false
+	}
+
+	// 提前预计算响应头值
+	methodsValue := "GET, POST, PUT, DELETE, OPTIONS"
+	if len(allowedMethods) > 0 {
+		methodsValue = strings.Join(allowedMethods, ", ")
+	}
+	headersValue := "Content-Type, Authorization"
+	if len(allowedHeaders) > 0 {
+		headersValue = strings.Join(allowedHeaders, ", ")
 	}
 
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
@@ -59,32 +78,17 @@ func CORS(allowedOrigins []string, allowedMethods []string, allowedHeaders []str
 			switch {
 			case len(allowedOrigins) == 0:
 				ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+			case allowAllOrigins:
+				ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
 			case origin != "" && originAllowed(origin):
-				for _, allowedOrigin := range allowedOrigins {
-					if allowedOrigin == "*" {
-						ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
-						break
-					}
-				}
-				if string(ctx.Response.Header.Peek("Access-Control-Allow-Origin")) == "" {
-					ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
-					ctx.Response.Header.Set("Vary", "Origin")
-					allowCredentials = true
-				}
+				ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+				ctx.Response.Header.Set("Vary", "Origin")
+				allowCredentials = true
 			}
 
 			// 设置其他CORS头
-			if len(allowedMethods) > 0 {
-				ctx.Response.Header.Set("Access-Control-Allow-Methods", strings.Join(allowedMethods, ", "))
-			} else {
-				ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			}
-
-			if len(allowedHeaders) > 0 {
-				ctx.Response.Header.Set("Access-Control-Allow-Headers", strings.Join(allowedHeaders, ", "))
-			} else {
-				ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			}
+			ctx.Response.Header.Set("Access-Control-Allow-Methods", methodsValue)
+			ctx.Response.Header.Set("Access-Control-Allow-Headers", headersValue)
 
 			if allowCredentials {
 				ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
@@ -215,11 +219,20 @@ var requestIDCounter uint64
 // generateRequestID 生成请求ID
 func generateRequestID() string {
 	id := atomic.AddUint64(&requestIDCounter, 1)
-	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), id)
+	// 避免 fmt.Sprintf 的反射开销，使用 strconv 拼接
+	buf := make([]byte, 0, len("req_")+40)
+	buf = append(buf, "req_"...)
+	buf = strconv.AppendInt(buf, time.Now().UnixNano(), 10)
+	buf = append(buf, '_')
+	buf = strconv.AppendUint(buf, id, 10)
+	return string(buf)
 }
 
 // Cache 缓存中间件
 func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	// 缓存容量上限，防止长期运行导致内存无限增长
+	const maxCacheItems = 10000
+
 	type cacheItem struct {
 		body       []byte
 		statusCode int
@@ -229,6 +242,33 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 
 	cache := make(map[string]cacheItem)
 	cacheMu := sync.RWMutex{}
+
+	// storeCacheItem 写入缓存，超出容量上限时先淘汰过期项，仍超限则淘汰最旧项
+	storeCacheItem := func(key string, item cacheItem) {
+		cacheMu.Lock()
+		defer cacheMu.Unlock()
+
+		if len(cache) >= maxCacheItems {
+			now := time.Now()
+			for k, it := range cache {
+				if now.Sub(it.time) >= duration {
+					delete(cache, k)
+				}
+			}
+		}
+		if len(cache) >= maxCacheItems {
+			var oldestKey string
+			var oldestTime time.Time
+			first := true
+			for k, it := range cache {
+				if first || it.time.Before(oldestTime) {
+					oldestKey, oldestTime, first = k, it.time, false
+				}
+			}
+			delete(cache, oldestKey)
+		}
+		cache[key] = item
+	}
 
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
@@ -264,14 +304,12 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 				bodyCopy := make([]byte, len(ctx.Response.Body()))
 				copy(bodyCopy, ctx.Response.Body())
 
-				cacheMu.Lock()
-				cache[key] = cacheItem{
+				storeCacheItem(key, cacheItem{
 					body:       bodyCopy,
 					statusCode: ctx.Response.StatusCode(),
 					headers:    headers,
 					time:       time.Now(),
-				}
-				cacheMu.Unlock()
+				})
 
 				ctx.Response.Header.Set("X-Cache", "MISS")
 			}
@@ -415,7 +453,13 @@ func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 					}
 				}
 
-				// 服务静态文件
+				if !cacheable {
+					// 大文件流式发送，避免整文件读入内存
+					ctx.SendFile(fileAbs)
+					return
+				}
+
+				// 小文件读入内存并缓存
 				data, err := os.ReadFile(fileAbs)
 				if err != nil {
 					ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
@@ -425,18 +469,16 @@ func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 				if contentType != "" {
 					ctx.SetContentType(contentType)
 				}
-				if cacheable {
-					bodyCopy := make([]byte, len(data))
-					copy(bodyCopy, data)
-					cacheMu.Lock()
-					cache[fileAbs] = staticCacheItem{
-						body:        bodyCopy,
-						contentType: contentType,
-						modTime:     info.ModTime(),
-						size:        info.Size(),
-					}
-					cacheMu.Unlock()
+				bodyCopy := make([]byte, len(data))
+				copy(bodyCopy, data)
+				cacheMu.Lock()
+				cache[fileAbs] = staticCacheItem{
+					body:        bodyCopy,
+					contentType: contentType,
+					modTime:     info.ModTime(),
+					size:        info.Size(),
 				}
+				cacheMu.Unlock()
 				ctx.SetStatusCode(fasthttp.StatusOK)
 				ctx.SetBody(data)
 				return

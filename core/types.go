@@ -21,12 +21,15 @@ type MiddlewareFunc func(*RequestContext) bool
 func NewMiddleware(fn MiddlewareFunc) Middleware {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
+			// 从对象池复用RequestContext，避免每次请求分配
 			// 注意：这里的RequestContext没有设置app字段，因为中间件是独立的
 			// 在实际使用中，app字段会在wrapHandler中被正确设置
-			reqCtx := &RequestContext{
-				RequestCtx: ctx,
-				params:     make(map[string]string),
-				startTime:  time.Now(),
+			reqCtx := requestContextPool.Get().(*RequestContext)
+			reqCtx.RequestCtx = ctx
+
+			// 清理上一请求残留的路径参数
+			for k := range reqCtx.params {
+				delete(reqCtx.params, k)
 			}
 
 			// 执行中间件函数
@@ -34,6 +37,8 @@ func NewMiddleware(fn MiddlewareFunc) Middleware {
 				// 如果中间件返回true，继续执行下一个处理器
 				next(ctx)
 			}
+
+			requestContextPool.Put(reqCtx)
 		}
 	}
 }
@@ -90,6 +95,11 @@ func (c *RequestContext) BindJSON(v interface{}) error {
 func (c *RequestContext) String(statusCode int, format string, args ...interface{}) {
 	c.SetStatusCode(statusCode)
 	c.SetContentType("text/plain; charset=utf-8")
+	if len(args) == 0 {
+		// 无参数时直接写入，避免 fmt.Sprintf 的反射开销和分配
+		c.SetBodyString(format)
+		return
+	}
 	c.SetBodyString(fmt.Sprintf(format, args...))
 }
 

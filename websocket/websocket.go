@@ -3,9 +3,9 @@ package websocket
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -84,10 +84,10 @@ func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Re
 		id:           generateID(),
 		ctx:          connCtx,
 		cancel:       cancel,
-		lastActivity: time.Now(),
 		readTimeout:  secondsToDuration(w.config.ReadTimeout),
 		writeTimeout: secondsToDuration(w.config.WriteTimeout),
 	}
+	connection.lastActivity.Store(time.Now().UnixNano())
 
 	if !w.manager.Add(connection) {
 		conn.Close(websocket.StatusNormalClosure, "max connections reached")
@@ -113,7 +113,7 @@ type Connection struct {
 	readMu       sync.Mutex
 	writeMu      sync.Mutex
 	closed       bool
-	lastActivity time.Time
+	lastActivity atomic.Int64 // 最近活动时间戳（UnixNano），原子更新避免每消息加锁
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 }
@@ -125,13 +125,13 @@ func (c *Connection) ID() string {
 
 // Send 发送消息
 func (c *Connection) Send(v interface{}) error {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -143,13 +143,13 @@ func (c *Connection) Send(v interface{}) error {
 
 // SendText 发送文本消息
 func (c *Connection) SendText(text string) error {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -161,13 +161,13 @@ func (c *Connection) SendText(text string) error {
 
 // SendBinary 发送二进制消息
 func (c *Connection) SendBinary(data []byte) error {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -179,13 +179,13 @@ func (c *Connection) SendBinary(data []byte) error {
 
 // Read 读取消息
 func (c *Connection) Read(v interface{}) error {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -197,13 +197,13 @@ func (c *Connection) Read(v interface{}) error {
 
 // ReadText 读取文本消息
 func (c *Connection) ReadText() (string, error) {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return "", ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -220,13 +220,13 @@ func (c *Connection) ReadText() (string, error) {
 
 // ReadBinary 读取二进制消息
 func (c *Connection) ReadBinary() ([]byte, error) {
-	c.mu.Lock()
+	c.mu.RLock()
 	if c.closed {
-		c.mu.Unlock()
+		c.mu.RUnlock()
 		return nil, ErrConnectionClosed
 	}
-	c.lastActivity = time.Now()
-	c.mu.Unlock()
+	c.mu.RUnlock()
+	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -315,7 +315,6 @@ func (m *ConnectionManager) Add(conn *Connection) bool {
 	}
 
 	m.connections[conn.id] = conn
-	log.Printf("WebSocket连接已添加: %s", conn.id)
 	return true
 }
 
@@ -324,7 +323,6 @@ func (m *ConnectionManager) Remove(id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.connections, id)
-	log.Printf("WebSocket连接已移除: %s", id)
 }
 
 // Get 获取连接
@@ -419,17 +417,17 @@ func (m *ConnectionManager) cleanupConnections() {
 		select {
 		case <-ticker.C:
 			m.mu.Lock()
-			currentTime := time.Now()
-			timeoutDuration := time.Duration(m.timeout) * time.Second
+			now := time.Now().UnixNano()
+			timeoutNano := int64(time.Duration(m.timeout) * time.Second)
 
 			var toCleanup []string
 			for id, conn := range m.connections {
 				conn.mu.RLock()
-				lastActivity := conn.lastActivity
 				closed := conn.closed
 				conn.mu.RUnlock()
+				lastActivity := conn.lastActivity.Load()
 
-				if closed || currentTime.Sub(lastActivity) > timeoutDuration {
+				if closed || now-lastActivity > timeoutNano {
 					toCleanup = append(toCleanup, id)
 				}
 			}
@@ -437,10 +435,7 @@ func (m *ConnectionManager) cleanupConnections() {
 			for _, id := range toCleanup {
 				conn := m.connections[id]
 				delete(m.connections, id)
-				go func(c *Connection, i string) {
-					c.Close()
-					log.Printf("WebSocket连接已超时并关闭: %s", i)
-				}(conn, id)
+				go conn.Close()
 			}
 			m.mu.Unlock()
 		case <-m.ctx.Done():

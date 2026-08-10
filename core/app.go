@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,9 +43,11 @@ type App struct {
 	cancel      context.CancelFunc
 	logger      *Logger
 
-	mu            sync.RWMutex
-	cachedHandler fasthttp.RequestHandler
-	handlerDirty  bool
+	// mu 保护中间件切片的读写
+	mu sync.Mutex
+	// handler 是中间件链应用后的最终处理器，读取频率极高（每请求），
+	// 使用 atomic.Pointer 避免每请求加锁
+	handler atomic.Pointer[fasthttp.RequestHandler]
 }
 
 // Config 应用配置
@@ -70,9 +73,9 @@ type MultiCoreConfig struct {
 	Enabled bool
 	// 指定使用的CPU核心数（0表示使用所有核心）
 	NumCPU int
-	// 每个核心的工作协程数
+	// 每个核心的工作协程数（预留字段，fasthttp 自带 worker pool，当前版本不生效）
 	WorkersPerCore int
-	// 是否启用CPU亲和性
+	// 是否启用CPU亲和性（预留字段，当前版本不生效）
 	EnableCPUAffinity bool
 	// 最大并发连接数
 	MaxConns int
@@ -133,8 +136,8 @@ func NewApp(config *Config) *App {
 		logger:      logger,
 	}
 
-	app.cachedHandler = app.applyMiddleware(app.router.Handler)
-	app.handlerDirty = false
+	handler := app.applyMiddleware(app.router.Handler)
+	app.handler.Store(&handler)
 
 	// 初始化WebSocket升级器
 	app.wsUpgrader = websocket.NewWebSocketUpgrader(nil)
@@ -148,9 +151,10 @@ func NewApp(config *Config) *App {
 		MaxRequestBodySize:           config.MaxRequestBodySize,
 		DisablePreParseMultipartForm: true,
 		GetOnly:                      false,
-		NoDefaultServerHeader:        false,
+		NoDefaultServerHeader:        true,
 		NoDefaultContentType:         false,
 		Name:                         config.ServerName,
+		TCPKeepalive:                 true,
 		// 多核性能优化配置
 		Concurrency:     config.MultiCore.MaxConns,
 		ReadBufferSize:  config.MultiCore.ReadBufferSize,
@@ -222,6 +226,12 @@ func isKnownLogLevel(name string) bool {
 
 // applyMultiCoreOptimization 应用多核性能优化
 func applyMultiCoreOptimization(config *Config) {
+	logf := func(format string, args ...interface{}) {
+		if config.RunMode == RunModeDebug {
+			log.Printf(format, args...)
+		}
+	}
+
 	if !config.MultiCore.Enabled {
 		return
 	}
@@ -229,116 +239,96 @@ func applyMultiCoreOptimization(config *Config) {
 	// 设置CPU核心数
 	if config.MultiCore.NumCPU > 0 {
 		runtime.GOMAXPROCS(config.MultiCore.NumCPU)
-		log.Printf("🔧 多核优化: 使用 %d 个CPU核心", config.MultiCore.NumCPU)
+		logf("🔧 多核优化: 使用 %d 个CPU核心", config.MultiCore.NumCPU)
 	} else {
 		numCPU := runtime.NumCPU()
 		runtime.GOMAXPROCS(numCPU)
-		log.Printf("🔧 多核优化: 使用所有 %d 个CPU核心", numCPU)
+		logf("🔧 多核优化: 使用所有 %d 个CPU核心", numCPU)
 	}
 
-	// 设置工作协程数
-	if config.MultiCore.WorkersPerCore > 0 {
-		totalWorkers := runtime.GOMAXPROCS(0) * config.MultiCore.WorkersPerCore
-		log.Printf("🔧 多核优化: 每个核心 %d 个工作协程，总计 %d 个",
-			config.MultiCore.WorkersPerCore, totalWorkers)
-	}
-
-	// 启用CPU亲和性（如果支持）
-	if config.MultiCore.EnableCPUAffinity {
-		log.Printf("🔧 多核优化: 启用CPU亲和性")
-		// 这里可以添加CPU亲和性设置逻辑
-	}
+	// 注意：fasthttp 内部自带 worker pool，WorkersPerCore 与 CPU 亲和性
+	// 配置项为预留字段，当前版本暂不生效（避免输出误导性日志）
 }
 
 // applyProductionOptimization 应用生产环境优化
 func applyProductionOptimization(config *Config) {
+	logf := func(format string, args ...interface{}) {
+		if config.RunMode == RunModeDebug {
+			log.Printf(format, args...)
+		}
+	}
+
 	if config.RunMode != RunModeRelease {
 		return
 	}
 
-	log.Printf("🏭 生产环境优化已启用")
+	logf("🏭 生产环境优化已启用")
 
 	// 1. 优化超时设置
 	if config.ReadTimeout == 30*time.Second {
 		config.ReadTimeout = 15 * time.Second
-		log.Printf("🔧 生产优化: 读取超时调整为 15s")
+		logf("🔧 生产优化: 读取超时调整为 15s")
 	}
 	if config.WriteTimeout == 30*time.Second {
 		config.WriteTimeout = 15 * time.Second
-		log.Printf("🔧 生产优化: 写入超时调整为 15s")
+		logf("🔧 生产优化: 写入超时调整为 15s")
 	}
 	if config.IdleTimeout == 60*time.Second {
 		config.IdleTimeout = 30 * time.Second
-		log.Printf("🔧 生产优化: 空闲超时调整为 30s")
+		logf("🔧 生产优化: 空闲超时调整为 30s")
 	}
 
 	// 2. 优化缓冲区大小
 	if config.MultiCore.ReadBufferSize == 4096 {
 		config.MultiCore.ReadBufferSize = 8192
-		log.Printf("🔧 生产优化: 读取缓冲区调整为 8KB")
+		logf("🔧 生产优化: 读取缓冲区调整为 8KB")
 	}
 	if config.MultiCore.WriteBufferSize == 4096 {
 		config.MultiCore.WriteBufferSize = 8192
-		log.Printf("🔧 生产优化: 写入缓冲区调整为 8KB")
+		logf("🔧 生产优化: 写入缓冲区调整为 8KB")
 	}
 
 	// 3. 优化并发连接数
 	if config.MultiCore.MaxConns == 10000 {
 		config.MultiCore.MaxConns = 50000
-		log.Printf("🔧 生产优化: 最大并发连接调整为 50,000")
+		logf("🔧 生产优化: 最大并发连接调整为 50,000")
 	}
 
 	// 4. 优化请求体大小限制
 	if config.MaxRequestBodySize == 4*1024*1024 {
 		config.MaxRequestBodySize = 16 * 1024 * 1024 // 16MB
-		log.Printf("🔧 生产优化: 最大请求体大小调整为 16MB")
+		logf("🔧 生产优化: 最大请求体大小调整为 16MB")
 	}
 
 	// 5. 优化工作协程数
 	if config.MultiCore.WorkersPerCore == 4 {
 		config.MultiCore.WorkersPerCore = 8
-		log.Printf("🔧 生产优化: 每核心工作协程数调整为 8")
+		logf("🔧 生产优化: 每核心工作协程数调整为 8")
 	}
 
 	// 6. 设置生产环境服务器名称
 	if config.ServerName == "Bingo" {
 		config.ServerName = "Bingo-Production"
-		log.Printf("🔧 生产优化: 服务器名称调整为 %s", config.ServerName)
+		logf("🔧 生产优化: 服务器名称调整为 %s", config.ServerName)
 	}
 
 	// 7. 优化日志级别
 	if config.LogLevel == "info" {
 		config.LogLevel = "warn"
-		log.Printf("🔧 生产优化: 日志级别调整为 warn")
+		logf("🔧 生产优化: 日志级别调整为 warn")
 	}
 
-	// 8. 启用TCP Keep-Alive
-	log.Printf("🔧 生产优化: 启用TCP Keep-Alive")
+	// 8. 启用TCP Keep-Alive（在 NewApp 中通过 fasthttp.Server.TCPKeepalive 启用）
+	logf("🔧 生产优化: 启用TCP Keep-Alive")
 
-	// 9. 启用HTTP/2
-	log.Printf("🔧 生产优化: 启用HTTP/2")
-
-	// 10. 优化内存分配
-	log.Printf("🔧 生产优化: 优化内存分配策略")
+	// 9. 优化内存分配策略
+	logf("🔧 生产优化: 优化内存分配策略")
 }
 
 // handleRequest 处理HTTP请求的主函数
 // 应用中间件链并路由到相应的处理器
 func (app *App) handleRequest(ctx *fasthttp.RequestCtx) {
-	app.mu.RLock()
-	if app.handlerDirty {
-		app.mu.RUnlock()
-		app.mu.Lock()
-		if app.handlerDirty {
-			app.cachedHandler = app.applyMiddleware(app.router.Handler)
-			app.handlerDirty = false
-		}
-		app.mu.Unlock()
-		app.mu.RLock()
-	}
-	handler := app.cachedHandler
-	app.mu.RUnlock()
-
+	handler := *app.handler.Load()
 	handler(ctx)
 }
 
@@ -353,9 +343,11 @@ func (app *App) applyMiddleware(handler fasthttp.RequestHandler) fasthttp.Reques
 // Use 添加中间件到应用
 func (app *App) Use(middleware Middleware) {
 	app.mu.Lock()
+	defer app.mu.Unlock()
 	app.middlewares = append(app.middlewares, middleware)
-	app.handlerDirty = true
-	app.mu.Unlock()
+	// 中间件链变化后立即重建处理器，避免请求时再检查
+	handler := app.applyMiddleware(app.router.Handler)
+	app.handler.Store(&handler)
 }
 
 // GET 注册GET路由
@@ -415,7 +407,10 @@ func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 		reqCtx := requestContextPool.Get().(*RequestContext)
 		reqCtx.RequestCtx = ctx
 		reqCtx.app = app
-		reqCtx.startTime = time.Now()
+		// 仅在需要记录请求日志时记录起始时间，避免 release 模式下无谓开销
+		if app.config.RunMode == RunModeDebug {
+			reqCtx.startTime = time.Now()
+		}
 
 		for k := range reqCtx.params {
 			delete(reqCtx.params, k)

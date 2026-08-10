@@ -35,7 +35,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 - github.com/valyala/fasthttp
 - github.com/fasthttp/router
 - github.com/bytedance/sonic
-- coder.io/websocket
+- github.com/coder/websocket
 
 ## 快速开始
 
