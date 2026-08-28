@@ -109,11 +109,10 @@ type Connection struct {
 	id           string
 	ctx          context.Context
 	cancel       context.CancelFunc
-	mu           sync.RWMutex
 	readMu       sync.Mutex
 	writeMu      sync.Mutex
-	closed       bool
-	lastActivity atomic.Int64 // 最近活动时间戳（UnixNano），原子更新避免每消息加锁
+	closed       atomic.Bool   // 连接是否已关闭，原子操作避免每消息加锁
+	lastActivity atomic.Int64  // 最近活动时间戳（UnixNano），原子更新避免每消息加锁
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 }
@@ -125,12 +124,9 @@ func (c *Connection) ID() string {
 
 // Send 发送消息
 func (c *Connection) Send(v interface{}) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
@@ -143,12 +139,9 @@ func (c *Connection) Send(v interface{}) error {
 
 // SendText 发送文本消息
 func (c *Connection) SendText(text string) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
@@ -161,12 +154,9 @@ func (c *Connection) SendText(text string) error {
 
 // SendBinary 发送二进制消息
 func (c *Connection) SendBinary(data []byte) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
@@ -179,12 +169,9 @@ func (c *Connection) SendBinary(data []byte) error {
 
 // Read 读取消息
 func (c *Connection) Read(v interface{}) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
@@ -197,12 +184,9 @@ func (c *Connection) Read(v interface{}) error {
 
 // ReadText 读取文本消息
 func (c *Connection) ReadText() (string, error) {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return "", ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
@@ -220,12 +204,9 @@ func (c *Connection) ReadText() (string, error) {
 
 // ReadBinary 读取二进制消息
 func (c *Connection) ReadBinary() ([]byte, error) {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	if c.closed.Load() {
 		return nil, ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
@@ -243,14 +224,10 @@ func (c *Connection) ReadBinary() ([]byte, error) {
 
 // Close 关闭连接
 func (c *Connection) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.closed {
+	if c.closed.Swap(true) {
 		return nil
 	}
 
-	c.closed = true
 	c.cancel()
 	// 尝试从管理器中移除连接，但不返回错误
 	// 因为连接可能已经被清理协程移除
@@ -260,9 +237,7 @@ func (c *Connection) Close() error {
 
 // IsClosed 检查连接是否已关闭
 func (c *Connection) IsClosed() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.closed
+	return c.closed.Load()
 }
 
 func (c *Connection) operationContext(timeout time.Duration) (context.Context, context.CancelFunc) {
@@ -422,12 +397,7 @@ func (m *ConnectionManager) cleanupConnections() {
 
 			var toCleanup []string
 			for id, conn := range m.connections {
-				conn.mu.RLock()
-				closed := conn.closed
-				conn.mu.RUnlock()
-				lastActivity := conn.lastActivity.Load()
-
-				if closed || now-lastActivity > timeoutNano {
+				if conn.closed.Load() || now-conn.lastActivity.Load() > timeoutNano {
 					toCleanup = append(toCleanup, id)
 				}
 			}

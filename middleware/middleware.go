@@ -317,6 +317,13 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 	}
 }
 
+// compressBufPool 复用压缩中间件的输出 buffer，减少 GC 压力
+var compressBufPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 // Compress 压缩中间件
 func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	var gzipPool sync.Pool
@@ -341,21 +348,25 @@ func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 				return
 			}
 
-			var buf bytes.Buffer
+			buf := compressBufPool.Get().(*bytes.Buffer)
+			buf.Reset()
 			w := gzipPool.Get().(*gzip.Writer)
-			w.Reset(&buf)
+			w.Reset(buf)
 			if _, err := w.Write(body); err != nil {
 				w.Close()
 				gzipPool.Put(w)
+				compressBufPool.Put(buf)
 				return
 			}
 			if err := w.Close(); err != nil {
 				gzipPool.Put(w)
+				compressBufPool.Put(buf)
 				return
 			}
 			gzipPool.Put(w)
 
 			ctx.Response.SetBody(buf.Bytes())
+			compressBufPool.Put(buf)
 			ctx.Response.Header.Set("Content-Encoding", "gzip")
 			ctx.Response.Header.Set("Vary", "Accept-Encoding")
 			ctx.Response.Header.Del("Content-Length")

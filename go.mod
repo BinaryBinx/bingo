@@ -3,7 +3,7 @@ module github.com/BinaryBinx/bingo
 go 1.26.5
 
 require (
-	github.com/bytedance/sonic v1.15.2
+	github.com/bytedance/sonic v1.15.3
 	github.com/coder/websocket v1.8.15
 	github.com/fasthttp/router v1.5.4
 	github.com/klauspost/compress v1.19.2
@@ -11,7 +11,7 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.2 // indirect
+	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
