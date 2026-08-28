@@ -57,6 +57,10 @@ type ErrorResponse struct {
 
 // SendError 发送错误响应
 func (c *RequestContext) SendError(statusCode int, err error, message string) {
+	// 防御 nil error，避免 err.Error() 直接 panic
+	if err == nil {
+		err = errors.New("unknown error")
+	}
 	c.JSON(statusCode, ErrorResponse{
 		Error:   err.Error(),
 		Message: message,

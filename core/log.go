@@ -23,7 +23,8 @@ const (
 	LogLevelFatal
 )
 
-var logLevelNames = map[LogLevel]string{
+// LogLevel 是连续的 iota 值，可直接作为数组索引，避免 map 查找开销
+var logLevelNames = [...]string{
 	LogLevelDebug: "DEBUG",
 	LogLevelInfo:  "INFO",
 	LogLevelWarn:  "WARN",

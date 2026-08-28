@@ -404,6 +404,8 @@ func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Requ
 // Static 静态文件中间件
 func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	const maxCacheableStaticFileSize = 1 << 20
+	// 缓存容量上限，防止静态文件持续更新/新增导致内存无限增长
+	const maxStaticCacheItems = 1000
 
 	type staticCacheItem struct {
 		body        []byte
@@ -483,11 +485,14 @@ func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 				bodyCopy := make([]byte, len(data))
 				copy(bodyCopy, data)
 				cacheMu.Lock()
-				cache[fileAbs] = staticCacheItem{
-					body:        bodyCopy,
-					contentType: contentType,
-					modTime:     info.ModTime(),
-					size:        info.Size(),
+				// 达到容量上限时不再缓存新文件，避免缓存无限膨胀
+				if len(cache) < maxStaticCacheItems {
+					cache[fileAbs] = staticCacheItem{
+						body:        bodyCopy,
+						contentType: contentType,
+						modTime:     info.ModTime(),
+						size:        info.Size(),
+					}
 				}
 				cacheMu.Unlock()
 				ctx.SetStatusCode(fasthttp.StatusOK)

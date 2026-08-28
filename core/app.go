@@ -155,6 +155,7 @@ func NewApp(config *Config) *App {
 		NoDefaultContentType:         false,
 		Name:                         config.ServerName,
 		TCPKeepalive:                 true,
+		TCPKeepalivePeriod:           30 * time.Second, // 定期探测死连接，及时清理失效连接
 		ReduceMemoryUsage:            true,
 		// 多核性能优化配置
 		Concurrency:     config.MultiCore.MaxConns,

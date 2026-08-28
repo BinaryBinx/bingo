@@ -395,19 +395,20 @@ func (m *ConnectionManager) cleanupConnections() {
 			now := time.Now().UnixNano()
 			timeoutNano := int64(time.Duration(m.timeout) * time.Second)
 
-			var toCleanup []string
+			var toClose []*Connection
 			for id, conn := range m.connections {
 				if conn.closed.Load() || now-conn.lastActivity.Load() > timeoutNano {
-					toCleanup = append(toCleanup, id)
+					delete(m.connections, id)
+					toClose = append(toClose, conn)
 				}
 			}
-
-			for _, id := range toCleanup {
-				conn := m.connections[id]
-				delete(m.connections, id)
-				go conn.Close()
-			}
 			m.mu.Unlock()
+
+			// 解锁后再同步关闭，避免大量连接超时时开启大量 goroutine；
+			// Close 内部的 Remove 是幂等的，已从 map 删除的连接再次删除无害
+			for _, conn := range toClose {
+				conn.Close()
+			}
 		case <-m.ctx.Done():
 			return
 		}
