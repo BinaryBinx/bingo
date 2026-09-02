@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"mime"
 	"net/url"
@@ -123,46 +124,45 @@ func Recovery() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	}
 }
 
-// RateLimit 限流中间件（简单实现）
+// RateLimit 限流中间件（惰性令牌桶，无后台 goroutine）
 func RateLimit(requestsPerSecond int) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	if requestsPerSecond <= 0 {
 		return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-			return func(ctx *fasthttp.RequestCtx) {
-				next(ctx)
-			}
+			return func(ctx *fasthttp.RequestCtx) { next(ctx) }
 		}
 	}
 
-	burst := requestsPerSecond * 2
-	tokens := make(chan struct{}, burst)
-	for i := 0; i < burst; i++ {
-		tokens <- struct{}{}
-	}
-
-	ticker := time.NewTicker(time.Second / time.Duration(requestsPerSecond))
-	stopCh := make(chan struct{})
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				select {
-				case tokens <- struct{}{}:
-				default:
-				}
-			case <-stopCh:
-				ticker.Stop()
-				return
-			}
-		}
-	}()
+	burst := int64(requestsPerSecond * 2)
+	var tokens atomic.Int64
+	tokens.Store(burst)
+	var lastRefill atomic.Int64
+	lastRefill.Store(time.Now().UnixNano())
+	var refillMu sync.Mutex
+	interval := int64(time.Second) / int64(requestsPerSecond)
 
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			select {
-			case <-tokens:
+			now := time.Now().UnixNano()
+			last := lastRefill.Load()
+			if now-last >= interval {
+				refillMu.Lock()
+				if last = lastRefill.Load(); now-last >= interval {
+					add := (now - last) / interval
+					if add > burst {
+						add = burst
+					}
+					lastRefill.Store(last + add*interval)
+					if v := tokens.Add(add); v > burst {
+						tokens.Store(burst)
+					}
+				}
+				refillMu.Unlock()
+			}
+
+			if tokens.Add(-1) >= 0 {
 				next(ctx)
-			default:
+			} else {
+				tokens.Add(1) // 回退
 				ctx.SetStatusCode(fasthttp.StatusTooManyRequests)
 				ctx.SetBodyString("Too Many Requests")
 			}
@@ -216,16 +216,27 @@ func RequestID() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 var requestIDCounter uint64
 
+// bufPool 复用 generateRequestID 的中间 buffer，避免每请求分配
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 0, 64)
+		return &buf
+	},
+}
+
 // generateRequestID 生成请求ID
 func generateRequestID() string {
 	id := atomic.AddUint64(&requestIDCounter, 1)
-	// 避免 fmt.Sprintf 的反射开销，使用 strconv 拼接
-	buf := make([]byte, 0, len("req_")+40)
+	bufPtr := bufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
 	buf = append(buf, "req_"...)
 	buf = strconv.AppendInt(buf, time.Now().UnixNano(), 10)
 	buf = append(buf, '_')
 	buf = strconv.AppendUint(buf, id, 10)
-	return string(buf)
+	s := string(buf)
+	*bufPtr = buf[:0]
+	bufPool.Put(bufPtr)
+	return s
 }
 
 // Cache 缓存中间件
@@ -430,7 +441,10 @@ func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 				ctx.Error("Bad Request", fasthttp.StatusBadRequest)
 				return
 			}
-			requestPath = strings.ReplaceAll(requestPath, "\\", "/")
+			// 仅在包含反斜杠时才替换，避免无谓的字符串分配
+			if strings.Contains(requestPath, "\\") {
+				requestPath = strings.ReplaceAll(requestPath, "\\", "/")
+			}
 			cleanPath := path.Clean("/" + requestPath)
 			if cleanPath == "/" {
 				cleanPath = "/index.html"
@@ -472,8 +486,14 @@ func Static(root string) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 					return
 				}
 
-				// 小文件读入内存并缓存
-				data, err := os.ReadFile(fileAbs)
+				// 小文件直接用 os.Open + io.ReadAll，避免 os.ReadFile 内部再次 stat
+				f, err := os.Open(fileAbs)
+				if err != nil {
+					ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
+					return
+				}
+				data, err := io.ReadAll(f)
+				f.Close()
 				if err != nil {
 					ctx.Error("Internal Server Error", fasthttp.StatusInternalServerError)
 					return
