@@ -3,6 +3,8 @@ package websocket
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -77,7 +79,9 @@ func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Re
 
 	conn.SetReadLimit(w.config.MaxMessageSize)
 
-	connCtx, cancel := context.WithCancel(context.Background())
+	// 连接 context 继承 manager 的 context：manager Shutdown 时，
+	// 正在阻塞的读写操作会随之取消，而不是拖住退出流程
+	connCtx, cancel := context.WithCancel(w.manager.ctx)
 	connection := &Connection{
 		conn:         conn,
 		manager:      w.manager,
@@ -89,9 +93,10 @@ func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Re
 	}
 	connection.lastActivity.Store(time.Now().UnixNano())
 
+	// Add 在同一把锁下检查 manager 关闭状态，杜绝 Shutdown 完成后仍接受新连接
 	if !w.manager.Add(connection) {
-		conn.Close(websocket.StatusNormalClosure, "max connections reached")
-		return nil, errors.New("websocket: max connections reached")
+		conn.CloseNow()
+		return nil, errors.New("websocket: max connections reached or manager closed")
 	}
 
 	return connection, nil
@@ -111,8 +116,8 @@ type Connection struct {
 	cancel       context.CancelFunc
 	readMu       sync.Mutex
 	writeMu      sync.Mutex
-	closed       atomic.Bool   // 连接是否已关闭，原子操作避免每消息加锁
-	lastActivity atomic.Int64  // 最近活动时间戳（UnixNano），原子更新避免每消息加锁
+	closed       atomic.Bool  // 连接是否已关闭，原子操作避免每消息加锁
+	lastActivity atomic.Int64 // 最近活动时间戳（UnixNano），原子更新避免每消息加锁
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 }
@@ -127,14 +132,20 @@ func (c *Connection) Send(v interface{}) error {
 	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
 	ctx, cancel := c.operationContext(c.writeTimeout)
 	defer cancel()
-	return wsjson.Write(ctx, c.conn, v)
+	err := wsjson.Write(ctx, c.conn, v)
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+	} else if err == nil {
+		// 只在成功通信后记录活动时间，失败的广播不再刷新清理阈值
+		c.lastActivity.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 // SendText 发送文本消息
@@ -142,14 +153,19 @@ func (c *Connection) SendText(text string) error {
 	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
 	ctx, cancel := c.operationContext(c.writeTimeout)
 	defer cancel()
-	return c.conn.Write(ctx, websocket.MessageText, []byte(text))
+	err := c.conn.Write(ctx, websocket.MessageText, []byte(text))
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+	} else if err == nil {
+		c.lastActivity.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 // SendBinary 发送二进制消息
@@ -157,14 +173,19 @@ func (c *Connection) SendBinary(data []byte) error {
 	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
 	ctx, cancel := c.operationContext(c.writeTimeout)
 	defer cancel()
-	return c.conn.Write(ctx, websocket.MessageBinary, data)
+	err := c.conn.Write(ctx, websocket.MessageBinary, data)
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+	} else if err == nil {
+		c.lastActivity.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 // Read 读取消息
@@ -172,14 +193,19 @@ func (c *Connection) Read(v interface{}) error {
 	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
 	ctx, cancel := c.operationContext(c.readTimeout)
 	defer cancel()
-	return wsjson.Read(ctx, c.conn, v)
+	err := wsjson.Read(ctx, c.conn, v)
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+	} else if err == nil {
+		c.lastActivity.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 // ReadText 读取文本消息
@@ -187,7 +213,6 @@ func (c *Connection) ReadText() (string, error) {
 	if c.closed.Load() {
 		return "", ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -195,10 +220,14 @@ func (c *Connection) ReadText() (string, error) {
 	ctx, cancel := c.operationContext(c.readTimeout)
 	defer cancel()
 	_, data, err := c.conn.Read(ctx)
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+		return "", err
+	}
 	if err != nil {
 		return "", err
 	}
-
+	c.lastActivity.Store(time.Now().UnixNano())
 	return string(data), nil
 }
 
@@ -207,7 +236,6 @@ func (c *Connection) ReadBinary() ([]byte, error) {
 	if c.closed.Load() {
 		return nil, ErrConnectionClosed
 	}
-	c.lastActivity.Store(time.Now().UnixNano())
 
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
@@ -215,14 +243,18 @@ func (c *Connection) ReadBinary() ([]byte, error) {
 	ctx, cancel := c.operationContext(c.readTimeout)
 	defer cancel()
 	_, data, err := c.conn.Read(ctx)
+	if isTerminalConnError(err) {
+		c.closeAfterIOError()
+		return nil, err
+	}
 	if err != nil {
 		return nil, err
 	}
-
+	c.lastActivity.Store(time.Now().UnixNano())
 	return data, nil
 }
 
-// Close 关闭连接
+// Close 关闭连接（执行关闭握手）
 func (c *Connection) Close() error {
 	if c.closed.Swap(true) {
 		return nil
@@ -232,7 +264,60 @@ func (c *Connection) Close() error {
 	// 尝试从管理器中移除连接，但不返回错误
 	// 因为连接可能已经被清理协程移除
 	c.manager.Remove(c.id)
+	if c.conn == nil {
+		return nil
+	}
 	return c.conn.Close(websocket.StatusNormalClosure, "")
+}
+
+// CloseNow 立即强制关闭连接，不执行关闭握手。
+// 用于退出期限内强制回收：随后对同一连接调用 Close 是幂等的
+func (c *Connection) CloseNow() {
+	if c.closed.Swap(true) {
+		return
+	}
+	c.cancel()
+	c.manager.Remove(c.id)
+	if c.conn != nil {
+		c.conn.CloseNow()
+	}
+}
+
+// closeAfterIOError 在读写遇到终止性错误时幂等清理连接：
+// 标记关闭、取消操作 context、移出管理器并强制回收底层连接。
+// 若调用方没有显式调用 Close，断开的连接不再占用连接名额
+func (c *Connection) closeAfterIOError() {
+	if c.closed.Swap(true) {
+		return
+	}
+	c.cancel()
+	c.manager.Remove(c.id)
+	if c.conn != nil {
+		c.conn.CloseNow()
+	}
+}
+
+// isTerminalConnError 判断错误是否表示连接已失效（对端关闭、网络错误等）。
+// 读写超时与 JSON 编解码错误不视为连接失效，避免误杀可用连接
+func isTerminalConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	return false
 }
 
 // IsClosed 检查连接是否已关闭
@@ -262,6 +347,7 @@ type ConnectionManager struct {
 	maxConns    int
 	ctx         context.Context
 	cancel      context.CancelFunc
+	closed      atomic.Bool // 是否已关闭（Shutdown 后拒绝新连接）
 }
 
 // NewConnectionManager 创建新的连接管理器
@@ -280,11 +366,16 @@ func NewConnectionManager() *ConnectionManager {
 	return manager
 }
 
-// Add 添加连接
+// Add 添加连接。
+// 在同一把锁下检查关闭状态与容量上限，与 Shutdown 协调：
+// 关闭状态一旦设置，后续 Add 全部失败，杜绝关闭后仍接受新连接
 func (m *ConnectionManager) Add(conn *Connection) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.closed.Load() {
+		return false
+	}
 	if m.maxConns > 0 && len(m.connections) >= m.maxConns {
 		return false
 	}
@@ -375,12 +466,11 @@ func (m *ConnectionManager) BroadcastBinary(data []byte) {
 	}
 }
 
-// CloseAll 关闭所有连接
+// CloseAll 关闭所有连接。
+// 为兼容旧的调用方式：无外部期限时使用统一的内部关闭预算，
+// 到期强制回收底层连接，避免串行握手拖住退出
 func (m *ConnectionManager) CloseAll() {
-	connections := m.GetAll()
-	for _, conn := range connections {
-		conn.Close()
-	}
+	m.Shutdown(context.Background())
 }
 
 // cleanupConnections 定期清理超时的连接
@@ -415,10 +505,71 @@ func (m *ConnectionManager) cleanupConnections() {
 	}
 }
 
-// Shutdown 关闭连接管理器
-func (m *ConnectionManager) Shutdown() {
+// Shutdown 关闭连接管理器。
+//
+// 在同一把锁下设置关闭状态、取消清理协程并取得待关闭快照，之后拒绝
+// 新的 Add；以有限并发执行关闭握手，并在统一期限内（5 秒或调用方
+// context 更早的截止时间）用 CloseNow 强制回收剩余连接，确保退出不被
+// 不回应关闭握手的对端拖住
+func (m *ConnectionManager) Shutdown(ctx context.Context) {
+	m.mu.Lock()
+	if m.closed.Load() {
+		m.mu.Unlock()
+		return
+	}
+	m.closed.Store(true)
 	m.cancel()
-	m.CloseAll()
+	conns := make([]*Connection, 0, len(m.connections))
+	for _, conn := range m.connections {
+		conns = append(conns, conn)
+	}
+	m.mu.Unlock()
+
+	const closeHandshakeBudget = 5 * time.Second
+	const closeWorkers = 64
+
+	var wg sync.WaitGroup
+	tasks := make(chan *Connection)
+	for i := 0; i < closeWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for conn := range tasks {
+				conn.Close()
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	for _, conn := range conns {
+		select {
+		case tasks <- conn:
+		case <-ctx.Done():
+			// 外部取消：放弃派发，直接进入强制回收
+			close(tasks)
+			goto force
+		}
+	}
+	close(tasks)
+
+	select {
+	case <-done:
+		return
+	case <-time.After(closeHandshakeBudget):
+	case <-ctx.Done():
+	}
+
+force:
+	// 期限内未完成的连接强制回收；已关闭的连接幂等跳过
+	for _, conn := range conns {
+		conn.CloseNow()
+	}
+	<-done
 }
 
 // SetTimeout 设置连接超时时间（秒）

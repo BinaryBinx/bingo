@@ -2,6 +2,8 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,7 +38,8 @@ func LoadConfig(filePath string) (*Config, error) {
 	return config, nil
 }
 
-// SaveConfig 保存配置到文件
+// SaveConfig 保存配置到文件。
+// 先写入同目录临时文件再原子替换，避免写坏已有配置
 func SaveConfig(config *Config, filePath string) error {
 	// 根据文件扩展名选择序列化方式
 	ext := strings.ToLower(filepath.Ext(filePath))
@@ -53,6 +56,7 @@ func SaveConfig(config *Config, filePath string) error {
 	if err != nil {
 		return err
 	}
+	data = append(data, '\n')
 
 	// 确保目录存在
 	dir := filepath.Dir(filePath)
@@ -60,14 +64,33 @@ func SaveConfig(config *Config, filePath string) error {
 		return err
 	}
 
-	// 写入文件
-	return os.WriteFile(filePath, data, 0644)
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpName, filePath)
 }
 
-// LoadConfigFromEnv 从环境变量加载配置
+// LoadConfigFromEnv 从环境变量加载配置。
+// 环境变量解析失败时返回带字段信息的错误，而不是静默忽略
 func LoadConfigFromEnv(config *Config) error {
 	if config == nil {
-		return nil
+		return errors.New("LoadConfigFromEnv: config is nil")
 	}
 
 	if host := os.Getenv("BINGO_HOST"); host != "" {
@@ -75,9 +98,11 @@ func LoadConfigFromEnv(config *Config) error {
 	}
 
 	if port := os.Getenv("BINGO_PORT"); port != "" {
-		if p, err := strconv.Atoi(port); err == nil {
-			config.Port = p
+		p, err := strconv.Atoi(port)
+		if err != nil {
+			return fmt.Errorf("LoadConfigFromEnv: invalid BINGO_PORT %q: %w", port, err)
 		}
+		config.Port = p
 	}
 
 	if runMode := os.Getenv("BINGO_RUN_MODE"); runMode != "" {
@@ -88,28 +113,36 @@ func LoadConfigFromEnv(config *Config) error {
 		config.LogLevel = logLevel
 	}
 
-	if readTimeout := os.Getenv("BINGO_READ_TIMEOUT"); readTimeout != "" {
-		if t, err := strconv.Atoi(readTimeout); err == nil {
-			config.ReadTimeout = time.Duration(t) * time.Second
+	if v := os.Getenv("BINGO_READ_TIMEOUT"); v != "" {
+		t, err := parseTimeoutEnv("BINGO_READ_TIMEOUT", v)
+		if err != nil {
+			return err
 		}
+		config.ReadTimeout = t
 	}
 
-	if writeTimeout := os.Getenv("BINGO_WRITE_TIMEOUT"); writeTimeout != "" {
-		if t, err := strconv.Atoi(writeTimeout); err == nil {
-			config.WriteTimeout = time.Duration(t) * time.Second
+	if v := os.Getenv("BINGO_WRITE_TIMEOUT"); v != "" {
+		t, err := parseTimeoutEnv("BINGO_WRITE_TIMEOUT", v)
+		if err != nil {
+			return err
 		}
+		config.WriteTimeout = t
 	}
 
-	if idleTimeout := os.Getenv("BINGO_IDLE_TIMEOUT"); idleTimeout != "" {
-		if t, err := strconv.Atoi(idleTimeout); err == nil {
-			config.IdleTimeout = time.Duration(t) * time.Second
+	if v := os.Getenv("BINGO_IDLE_TIMEOUT"); v != "" {
+		t, err := parseTimeoutEnv("BINGO_IDLE_TIMEOUT", v)
+		if err != nil {
+			return err
 		}
+		config.IdleTimeout = t
 	}
 
 	if maxBodySize := os.Getenv("BINGO_MAX_BODY_SIZE"); maxBodySize != "" {
-		if s, err := strconv.Atoi(maxBodySize); err == nil {
-			config.MaxRequestBodySize = s
+		s, err := strconv.Atoi(maxBodySize)
+		if err != nil {
+			return fmt.Errorf("LoadConfigFromEnv: invalid BINGO_MAX_BODY_SIZE %q: %w", maxBodySize, err)
 		}
+		config.MaxRequestBodySize = s
 	}
 
 	if serverName := os.Getenv("BINGO_SERVER_NAME"); serverName != "" {
@@ -117,4 +150,13 @@ func LoadConfigFromEnv(config *Config) error {
 	}
 
 	return nil
+}
+
+// parseTimeoutEnv 解析秒为单位的超时环境变量
+func parseTimeoutEnv(name, value string) (time.Duration, error) {
+	seconds, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("LoadConfigFromEnv: invalid %s %q: %w", name, value, err)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }

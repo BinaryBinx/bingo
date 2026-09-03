@@ -7,7 +7,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 - 灵活的路由系统（fasthttp/router）
 - 极速 JSON 编解码（bytedance/sonic）
 - 原生 WebSocket 支持（coder/websocket）
-- **多核性能优化** - 自动利用所有CPU核心
+- **多核性能优化** - 保留运行时核心策略（Go 自动适配宿主与容器配额）
 - 支持中间件链、路由分组、优雅关机
 - 代码结构清晰，易于扩展
 
@@ -36,6 +36,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 - github.com/fasthttp/router
 - github.com/bytedance/sonic
 - github.com/coder/websocket
+- github.com/fasthttp/websocket（示例：fasthttp 原生 WebSocket 升级）
 
 ## 快速开始
 
@@ -99,12 +100,12 @@ curl http://localhost:8080/api/v1/users/456
 ### 6. 运行模式示例
 ```bash
 cd examples/runmode
-# 启动服务
+# 启动服务（Release 模式，监听 8080）
 go run main.go
-# 测试不同模式
-curl http://localhost:8080/  # 调试模式 (启用日志)
-curl http://localhost:8081/  # 生产模式 (禁用日志)
-curl http://localhost:8082/  # 测试模式 (禁用日志)
+# 验证配置在 Release 模式下的优化生效
+curl http://localhost:8080/  # 生产模式 (禁用请求日志)
+curl http://localhost:8080/config
+curl http://localhost:8080/health
 ```
 
 ## 示例
@@ -213,16 +214,15 @@ app.Use(middleware.Recovery())
 
 ### 多核性能优化
 ```go
-config := &core.Config{
-    MultiCore: core.MultiCoreConfig{
-        Enabled: true,
-        NumCPU: 0,        // 使用所有核心
-        WorkersPerCore: 4,
-        MaxConns: 10000,
-    },
-}
+// 推荐：基于默认配置覆盖，避免缺少超时等默认值
+config := core.DefaultConfig()
+config.MultiCore.Enabled = true
+config.MultiCore.NumCPU = 0 // 0 = 保留运行时现有核心策略（含容器 cgroup 自适应）
+config.MultiCore.MaxConns = 10000
 app := core.NewApp(config)
 ```
+> 说明：Go 1.21+ 运行时已按 Linux cgroup 配额自动调整 GOMAXPROCS，
+> `NumCPU=0` 时不显式覆盖。`WorkersPerCore` / `EnableCPUAffinity` 为预留字段，当前版本不生效。
 
 ### 运行模式配置
 ```go
@@ -242,8 +242,10 @@ if app.IsDebug() {
 }
 ```
 
-### WebSocket 聊天室
+### WebSocket (net/http 风格)
 ```go
+// Bingo 的 websocket 包基于 net/http 风格接口（Upgrade 需要 http.Hijacker），
+// 适合与标准库 http.Server 配合
 wsUpgrader := websocket.NewWebSocketUpgrader(nil)
 http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
     conn, _ := wsUpgrader.Upgrade(w, r)
@@ -251,12 +253,15 @@ http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
     for {
         var msg map[string]interface{}
         if err := conn.Read(&msg); err != nil {
+            // 连接断开：Read 返回终止性错误时框架已自动清理连接
             break
         }
         wsUpgrader.GetManager().Broadcast(msg)
     }
 })
 ```
+> 在 fasthttp 服务器（`app.Run()`）内请使用 fasthttp 原生升级路径，
+> 参考 examples/websocket（`github.com/fasthttp/websocket` 的 `FastHTTPUpgrader`）。
 
 ## 运行模式
 
@@ -273,7 +278,6 @@ Bingo框架支持三种运行模式：
   - **超时优化**: 读取15s, 写入15s, 空闲30s
   - **缓冲区优化**: 读取8KB, 写入8KB
   - **并发优化**: 最大连接50,000
-  - **工作协程**: 每核心8个
   - **请求体限制**: 16MB
   - **日志级别**: warn
   - **服务器名称**: Bingo-Production

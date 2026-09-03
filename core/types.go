@@ -21,28 +21,65 @@ type MiddlewareFunc func(*RequestContext) bool
 func NewMiddleware(fn MiddlewareFunc) Middleware {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
-			// 从对象池复用RequestContext，避免每次请求分配
-			// 注意：这里的RequestContext没有设置app字段，因为中间件是独立的
-			// 在实际使用中，app字段会在wrapHandler中被正确设置
-			reqCtx := requestContextPool.Get().(*RequestContext)
+			// 从对象池复用RequestContext，避免每次请求分配。
+			// 注意：独立的中间件无法确定所属 App，acquire 后 app 为 nil，
+			// ctx.App() 返回 nil，不会串用其他应用的旧实例
+			reqCtx := acquireRequestContext()
 			reqCtx.RequestCtx = ctx
-
-			// 清理上一请求残留的路径参数
-			if len(reqCtx.params) > 0 {
-				for k := range reqCtx.params {
-					delete(reqCtx.params, k)
-				}
-			}
+			defer releaseRequestContext(reqCtx)
 
 			// 执行中间件函数
 			if fn(reqCtx) {
 				// 如果中间件返回true，继续执行下一个处理器
 				next(ctx)
 			}
-
-			requestContextPool.Put(reqCtx)
 		}
 	}
+}
+
+// acquireRequestContext 从对象池获取RequestContext并清理复用状态：
+// 清空上一请求残留的路径参数，确保新请求拿到干净的实例
+func acquireRequestContext() *RequestContext {
+	reqCtx := requestContextPool.Get().(*RequestContext)
+	if reqCtx.params == nil {
+		reqCtx.params = make(map[string]string)
+	} else if len(reqCtx.params) > 0 {
+		clear(reqCtx.params)
+	}
+	return reqCtx
+}
+
+// releaseRequestContext 归还RequestContext到对象池：
+// 清空持有的指针与时间戳，避免跨请求/跨应用引用串用；
+// 路径参数过大的 map 直接丢弃，避免池中滞留大内存高水位
+func releaseRequestContext(reqCtx *RequestContext) {
+	reqCtx.RequestCtx = nil
+	reqCtx.app = nil
+	reqCtx.startTime = time.Time{}
+	if len(reqCtx.params) > 128 {
+		reqCtx.params = make(map[string]string, 8)
+	} else if len(reqCtx.params) > 0 {
+		clear(reqCtx.params)
+	}
+	requestContextPool.Put(reqCtx)
+}
+
+// resetErrorResponse 重建 500 错误响应：清理 handler 可能已写入的实体相关头
+// （Content-Encoding/Content-Type/Content-Length 等），避免客户端按旧头解析
+// 错误正文导致解码失败。保留请求追踪（X-Request-ID）与跨域头
+func resetErrorResponse(ctx *fasthttp.RequestCtx) {
+	h := &ctx.Response.Header
+	h.Del("Content-Encoding")
+	h.Del("Content-Type")
+	h.Del("Content-Length")
+	h.Del("Transfer-Encoding")
+	h.Del("Content-Range")
+	h.Del("ETag")
+	h.Del("Last-Modified")
+	ctx.Response.ResetBody()
+	ctx.SetContentType("text/plain; charset=utf-8")
+	ctx.SetStatusCode(fasthttp.StatusInternalServerError)
+	ctx.SetBodyString("Internal Server Error")
 }
 
 // RequestContext 扩展fasthttp.RequestCtx，提供更友好的API

@@ -6,6 +6,7 @@ require (
 	github.com/bytedance/sonic v1.15.3
 	github.com/coder/websocket v1.8.15
 	github.com/fasthttp/router v1.5.4
+	github.com/fasthttp/websocket v1.5.12
 	github.com/klauspost/compress v1.19.2
 	github.com/valyala/fasthttp v1.73.0
 )
@@ -20,5 +21,6 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	golang.org/x/arch v0.30.0 // indirect
+	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 )

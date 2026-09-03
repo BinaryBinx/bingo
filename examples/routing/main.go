@@ -49,7 +49,7 @@ func main() {
 					
 					<div class="section">
 						<h2>1. 路径参数路由</h2>
-						<p>使用 <code>:param</code> 语法定义路径参数</p>
+						<p>使用 <code>{param}</code> 语法定义路径参数</p>
 						<a href="/user/123" class="test-link">用户详情: /user/123</a>
 						<a href="/user/456/profile" class="test-link">用户资料: /user/456/profile</a>
 						<a href="/product/789" class="test-link">产品详情: /product/789</a>

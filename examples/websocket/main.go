@@ -1,15 +1,17 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
-	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BinaryBinx/bingo/core"
 	"github.com/BinaryBinx/bingo/middleware"
-	"github.com/BinaryBinx/bingo/websocket"
 
+	"github.com/fasthttp/websocket"
 	"github.com/valyala/fasthttp"
 )
 
@@ -25,18 +27,27 @@ type ChatMessage struct {
 
 // ChatRoom 聊天室管理器
 type ChatRoom struct {
-	app    *core.App
-	users  map[string]*websocket.Connection
-	colors map[string]string // 用户颜色映射
-	mu     sync.RWMutex
+	app      *core.App
+	upgrader websocket.FastHTTPUpgrader
+	// users 以唯一用户名（连接计数）为键，避免同秒生成相同用户名互相覆盖
+	users   map[string]*websocket.Conn
+	colors  map[string]string // 用户颜色映射
+	mu      sync.RWMutex
+	userSeq atomic.Uint64
 }
 
 // NewChatRoom 创建新的聊天室
 func NewChatRoom(app *core.App) *ChatRoom {
 	return &ChatRoom{
 		app:    app,
-		users:  make(map[string]*websocket.Connection),
+		users:  make(map[string]*websocket.Conn),
 		colors: make(map[string]string),
+		// fasthttp 原生升级器：在回调中交付升级完成的连接，全程可运行
+		upgrader: websocket.FastHTTPUpgrader{
+			EnableCompression: true,
+			// 示例放开跨域限制；生产环境应校验 Origin
+			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool { return true },
+		},
 	}
 }
 
@@ -55,8 +66,6 @@ var userColors = []string{
 	"#F8C471", // 橙色
 	"#82E0AA", // 浅绿色
 	"#F1948A", // 粉红色
-	"#85C1E9", // 浅蓝色
-	"#F7DC6F", // 金黄色
 }
 
 // assignUserColor 为用户分配颜色
@@ -64,12 +73,10 @@ func (cr *ChatRoom) assignUserColor(username string) string {
 	cr.mu.Lock()
 	defer cr.mu.Unlock()
 
-	// 如果用户已有颜色，返回现有颜色
 	if color, exists := cr.colors[username]; exists {
 		return color
 	}
 
-	// 根据用户数量分配颜色
 	colorIndex := len(cr.colors) % len(userColors)
 	color := userColors[colorIndex]
 	cr.colors[username] = color
@@ -88,31 +95,52 @@ func (cr *ChatRoom) getUserColor(username string) string {
 	return "#666666" // 默认颜色
 }
 
-// HandleWebSocket 处理WebSocket连接
+// HandleWebSocket 处理WebSocket连接的升级与消息循环
 func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
-	// 创建fasthttp到标准http的适配器
-	adapter := &fasthttpAdapter{
-		ctx: ctx.RequestCtx,
-	}
-
-	// 升级到WebSocket连接
-	conn, err := cr.app.GetWebSocketUpgrader().Upgrade(adapter, adapter.Request())
+	err := cr.upgrader.Upgrade(ctx.RequestCtx, cr.handleConn)
 	if err != nil {
 		log.Printf("WebSocket升级失败: %v", err)
-		return
 	}
+}
 
-	// 生成用户名
-	username := generateUsername()
+// handleConn 在 hijacked 连接的 goroutine 中运行单个连接的消息循环
+func (cr *ChatRoom) handleConn(conn *websocket.Conn) {
+	// 防止超限消息占用内存
+	conn.SetReadLimit(4 * 1024 * 1024)
 
-	// 为用户分配颜色
+	// 使用连接计数生成唯一用户名，避免同秒重复
+	username := fmt.Sprintf("用户%d", cr.userSeq.Add(1))
 	userColor := cr.assignUserColor(username)
 
-	// 添加到聊天室
 	cr.mu.Lock()
 	cr.users[username] = conn
 	userCount := len(cr.users)
 	cr.mu.Unlock()
+
+	defer func() {
+		// 成功升级后必须显式关闭连接，释放资源
+		conn.Close()
+
+		// 移除用户并清理其颜色记录
+		cr.mu.Lock()
+		if _, ok := cr.users[username]; ok {
+			delete(cr.users, username)
+			delete(cr.colors, username)
+		}
+		userCount = len(cr.users)
+		cr.mu.Unlock()
+
+		leaveMsg := ChatMessage{
+			Type:      "leave",
+			Username:  username,
+			Message:   "离开了聊天室",
+			Timestamp: time.Now(),
+			UserCount: userCount,
+			UserColor: userColor,
+		}
+		cr.broadcastMessage(leaveMsg, conn)
+		log.Printf("用户 %s 离开聊天室，当前用户数: %d", username, userCount)
+	}()
 
 	// 发送欢迎消息
 	welcomeMsg := ChatMessage{
@@ -123,7 +151,7 @@ func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
 		UserCount: userCount,
 		UserColor: userColor,
 	}
-	cr.broadcastMessage(welcomeMsg)
+	cr.broadcastMessage(welcomeMsg, nil)
 
 	// 发送系统消息
 	systemMsg := ChatMessage{
@@ -134,15 +162,20 @@ func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
 		UserCount: userCount,
 		UserColor: "#666666",
 	}
-	conn.Send(systemMsg)
+	_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(systemMsg))
 
 	log.Printf("用户 %s 加入聊天室，当前用户数: %d", username, userCount)
 
-	// 处理消息
 	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			// 连接断开（对端关闭、网络错误），结束消息循环
+			return
+		}
+
 		var msg ChatMessage
-		if err := conn.Read(&msg); err != nil {
-			break
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
 		}
 
 		// 设置消息属性
@@ -160,28 +193,10 @@ func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
 			continue
 		}
 
-		// 广播消息
-		cr.broadcastMessage(msg)
+		// 广播消息（不回送给发送者自己）
+		cr.broadcastMessage(msg, conn)
 		log.Printf("[%s] %s: %s", msg.Timestamp.Format("15:04:05"), username, msg.Message)
 	}
-
-	// 用户离开
-	cr.mu.Lock()
-	delete(cr.users, username)
-	userCount = len(cr.users)
-	cr.mu.Unlock()
-
-	leaveMsg := ChatMessage{
-		Type:      "leave",
-		Username:  username,
-		Message:   "离开了聊天室",
-		Timestamp: time.Now(),
-		UserCount: userCount,
-		UserColor: userColor,
-	}
-	cr.broadcastMessage(leaveMsg)
-
-	log.Printf("用户 %s 离开聊天室，当前用户数: %d", username, userCount)
 }
 
 // handleCommand 处理特殊命令
@@ -205,7 +220,7 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 			UserCount: userCount,
 			UserColor: "#666666",
 		}
-		conn.Send(helpMsg)
+		_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(helpMsg))
 	case "/users":
 		cr.mu.RLock()
 		userList := "在线用户: "
@@ -224,7 +239,7 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 			UserCount: userCount,
 			UserColor: "#666666",
 		}
-		conn.Send(userMsg)
+		_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(userMsg))
 	case "/time":
 		timeMsg := ChatMessage{
 			Type:      "system",
@@ -234,54 +249,63 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 			UserCount: userCount,
 			UserColor: "#666666",
 		}
-		conn.Send(timeMsg)
+		_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(timeMsg))
 	}
 }
 
-// broadcastMessage 广播消息
-func (cr *ChatRoom) broadcastMessage(msg ChatMessage) {
+// broadcastMessage 广播消息：锁内只取连接快照，锁外执行网络发送，
+// 避免慢连接持锁阻塞加入/退出；JSON 预编码一次，重复使用只读字节
+func (cr *ChatRoom) broadcastMessage(msg ChatMessage, skip *websocket.Conn) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
 	cr.mu.RLock()
-	defer cr.mu.RUnlock()
+	conns := make([]*websocket.Conn, 0, len(cr.users))
+	for _, c := range cr.users {
+		conns = append(conns, c)
+	}
+	cr.mu.RUnlock()
 
-	for _, conn := range cr.users {
-		conn.Send(msg)
+	for _, c := range conns {
+		if c == skip {
+			continue
+		}
+		if err := c.WriteMessage(websocket.TextMessage, data); err != nil {
+			// 发送失败说明连接已失效，幂等移除并关闭
+			cr.removeConn(c)
+		}
 	}
 }
 
-// fasthttpAdapter fasthttp到标准http的适配器
-type fasthttpAdapter struct {
-	ctx *fasthttp.RequestCtx
+// removeConn 幂等移除连接并关闭
+func (cr *ChatRoom) removeConn(conn *websocket.Conn) {
+	cr.mu.Lock()
+	for name, c := range cr.users {
+		if c == conn {
+			delete(cr.users, name)
+			delete(cr.colors, name)
+			break
+		}
+	}
+	cr.mu.Unlock()
+	_ = conn.Close()
 }
 
-func (a *fasthttpAdapter) Header() http.Header {
-	// 这里需要实现fasthttp到标准http的header转换
-	// 简化实现，返回空header
-	return make(http.Header)
-}
-
-func (a *fasthttpAdapter) Write(data []byte) (int, error) {
-	a.ctx.SetBody(data)
-	return len(data), nil
-}
-
-func (a *fasthttpAdapter) WriteHeader(statusCode int) {
-	a.ctx.SetStatusCode(statusCode)
-}
-
-func (a *fasthttpAdapter) Request() *http.Request {
-	// 这里需要实现fasthttp.Request到标准http.Request的转换
-	// 简化实现，返回nil
-	return nil
-}
-
-// generateUsername 生成用户名
-func generateUsername() string {
-	return "用户" + time.Now().Format("150405")
+// mustMarshalJS 序列化聊天消息（配置固定，失败视为编程错误直接 panic）
+func mustMarshalJS(msg ChatMessage) []byte {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }
 
 func main() {
-	// 创建Bingo应用
+	// 基于 DefaultConfig 覆盖，避免手工字面量缺失超时等默认值
 	app := core.NewApp(nil)
+	app.SetRunMode(core.RunModeRelease)
 
 	// 创建聊天室
 	chatRoom := NewChatRoom(app)
@@ -512,44 +536,12 @@ const chatRoomHTML = `
             transform: none;
         }
 
-        .typing-indicator {
-            padding: 10px 20px;
-            font-style: italic;
-            color: #666;
-            font-size: 12px;
-        }
-
-        .emoji-picker {
-            position: absolute;
-            bottom: 100%;
-            right: 0;
-            background: white;
-            border: 1px solid #e9ecef;
-            border-radius: 10px;
-            padding: 10px;
-            display: none;
-            grid-template-columns: repeat(6, 1fr);
-            gap: 5px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-        }
-
-        .emoji {
-            cursor: pointer;
-            padding: 5px;
-            border-radius: 5px;
-            transition: background 0.2s;
-        }
-
-        .emoji:hover {
-            background: #f8f9fa;
-        }
-
         @media (max-width: 768px) {
             .chat-container {
                 width: 95%;
                 height: 90vh;
             }
-            
+
             .message-content {
                 max-width: 85%;
             }
@@ -563,7 +555,7 @@ const chatRoomHTML = `
             <h1>💬 Bingo 聊天室</h1>
             <div class="user-count">在线用户: <span id="userCount">0</span></div>
         </div>
-        
+
         <div class="chat-messages" id="chatMessages">
             <div class="message system">
                 <div class="message-content">
@@ -571,7 +563,7 @@ const chatRoomHTML = `
                 </div>
             </div>
         </div>
-        
+
         <div class="chat-input">
             <input type="text" class="message-input" id="messageInput" placeholder="输入消息..." maxlength="500">
             <button class="send-button" id="sendButton">发送</button>
@@ -583,6 +575,8 @@ const chatRoomHTML = `
         let isConnected = false;
         let reconnectAttempts = 0;
         const maxReconnectAttempts = 5;
+        // 限制聊天记录条数，避免长时间使用 DOM 无限增长
+        const maxMessages = 200;
 
         // DOM元素
         const chatMessages = document.getElementById('chatMessages');
@@ -595,26 +589,26 @@ const chatRoomHTML = `
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = protocol + '//' + window.location.host + '/ws';
-            
+
             ws = new WebSocket(wsUrl);
-            
+
             ws.onopen = function() {
                 isConnected = true;
                 reconnectAttempts = 0;
                 statusIndicator.classList.add('connected');
                 addSystemMessage('连接成功！');
             };
-            
+
             ws.onmessage = function(event) {
                 const message = JSON.parse(event.data);
                 displayMessage(message);
             };
-            
+
             ws.onclose = function() {
                 isConnected = false;
                 statusIndicator.classList.remove('connected');
                 addSystemMessage('连接断开，正在重连...');
-                
+
                 if (reconnectAttempts < maxReconnectAttempts) {
                     reconnectAttempts++;
                     setTimeout(connectWebSocket, 2000);
@@ -622,48 +616,62 @@ const chatRoomHTML = `
                     addSystemMessage('重连失败，请刷新页面重试。');
                 }
             };
-            
+
             ws.onerror = function(error) {
                 console.error('WebSocket错误:', error);
                 addSystemMessage('连接错误，请检查网络。');
             };
         }
 
-        // 显示消息
-        function displayMessage(message) {
+        // 创建消息元素（全部使用 DOM API / textContent，杜绝 innerHTML 注入 XSS）
+        function createMessageDom(message) {
             const messageDiv = document.createElement('div');
-            messageDiv.className = 'message ' + message.type;
-            
+            messageDiv.className = 'message ' + (message.type || 'message');
+
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
-            
-            let displayText = '';
+
             if (message.type === 'message') {
-                const usernameSpan = '<span class="username" style="background-color: ' + message.userColor + '">' + message.username + '</span>';
-                displayText = usernameSpan + message.message;
-            } else if (message.type === 'join') {
-                displayText = '👋 ' + message.username + ' ' + message.message;
-            } else if (message.type === 'leave') {
-                displayText = '👋 ' + message.username + ' ' + message.message;
+                if (message.username) {
+                    const usernameSpan = document.createElement('span');
+                    usernameSpan.className = 'username';
+                    usernameSpan.style.backgroundColor = message.userColor || '#666666';
+                    usernameSpan.textContent = message.username;
+                    contentDiv.appendChild(usernameSpan);
+                }
+                contentDiv.appendChild(document.createTextNode(message.message || ''));
+            } else if (message.type === 'join' || message.type === 'leave') {
+                contentDiv.textContent = (message.type === 'join' ? '👋 ' : '👋 ') + (message.username || '') + ' ' + (message.message || '');
             } else {
-                displayText = message.message;
+                contentDiv.textContent = message.message || '';
             }
-            
-            contentDiv.innerHTML = displayText;
-            
+
+            messageDiv.appendChild(contentDiv);
+
             const infoDiv = document.createElement('div');
             infoDiv.className = 'message-info';
             infoDiv.textContent = formatTime(message.timestamp);
-            
-            messageDiv.appendChild(contentDiv);
             messageDiv.appendChild(infoDiv);
-            
-            chatMessages.appendChild(messageDiv);
+
+            return messageDiv;
+        }
+
+        // 显示消息
+        function displayMessage(message) {
+            chatMessages.appendChild(createMessageDom(message));
+            trimMessages();
             scrollToBottom();
-            
+
             // 更新用户数
             if (message.userCount !== undefined) {
                 userCount.textContent = message.userCount;
+            }
+        }
+
+        // 限制消息条数
+        function trimMessages() {
+            while (chatMessages.childElementCount > maxMessages) {
+                chatMessages.removeChild(chatMessages.firstElementChild);
             }
         }
 
@@ -671,13 +679,14 @@ const chatRoomHTML = `
         function addSystemMessage(text) {
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message system';
-            
+
             const contentDiv = document.createElement('div');
             contentDiv.className = 'message-content';
             contentDiv.textContent = text;
-            
+
             messageDiv.appendChild(contentDiv);
             chatMessages.appendChild(messageDiv);
+            trimMessages();
             scrollToBottom();
         }
 
@@ -685,12 +694,12 @@ const chatRoomHTML = `
         function sendMessage() {
             const message = messageInput.value.trim();
             if (!message || !isConnected) return;
-            
+
             const messageData = {
                 type: 'message',
                 message: message
             };
-            
+
             ws.send(JSON.stringify(messageData));
             messageInput.value = '';
         }
@@ -703,26 +712,18 @@ const chatRoomHTML = `
         // 格式化时间
         function formatTime(timestamp) {
             const date = new Date(timestamp);
-            return date.toLocaleTimeString('zh-CN', { 
-                hour: '2-digit', 
-                minute: '2-digit' 
+            return date.toLocaleTimeString('zh-CN', {
+                hour: '2-digit',
+                minute: '2-digit'
             });
         }
 
         // 事件监听
         sendButton.addEventListener('click', sendMessage);
-        
+
         messageInput.addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 sendMessage();
-            }
-        });
-
-        // 自动滚动
-        chatMessages.addEventListener('scroll', function() {
-            const isAtBottom = chatMessages.scrollTop + chatMessages.clientHeight >= chatMessages.scrollHeight - 10;
-            if (isAtBottom) {
-                // 用户正在查看最新消息，保持自动滚动
             }
         });
 

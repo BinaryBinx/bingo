@@ -10,20 +10,18 @@ import (
 )
 
 func main() {
-	// 创建多核优化配置
-	config := &core.Config{
-		Host: "0.0.0.0",
-		Port: 8080,
-		MultiCore: core.MultiCoreConfig{
-			Enabled:           true,
-			NumCPU:            0, // 使用所有核心
-			WorkersPerCore:    4,
-			EnableCPUAffinity: false,
-			MaxConns:          10000,
-			ReadBufferSize:    8192, // 增大缓冲区
-			WriteBufferSize:   8192,
-		},
-	}
+	// 基于默认配置覆盖字段，避免手工字面量缺失超时等默认值
+	config := core.DefaultConfig()
+	config.Host = "0.0.0.0"
+	config.Port = 8080
+	// Release 模式避免 Debug 请求日志干扰性能测量
+	config.RunMode = core.RunModeRelease
+	config.MultiCore.Enabled = true
+	config.MultiCore.NumCPU = 0            // 0 表示保留运行时现有核心策略（含容器 cgroup 自适应）
+	config.MultiCore.MaxConns = 10000      //
+	config.MultiCore.ReadBufferSize = 8192 // 增大缓冲区
+	config.MultiCore.WriteBufferSize = 8192
+	// WorkersPerCore / EnableCPUAffinity 为预留字段，当前版本不生效
 
 	// 创建应用实例
 	app := core.NewApp(config)
@@ -148,7 +146,7 @@ ab -n 10000 -c 100 http://localhost:8080/ping
 	})
 
 	log.Printf("🚀 Bingo多核性能测试服务器启动在 %s:%d", config.Host, config.Port)
-	log.Printf("🔧 多核优化已启用，使用 %d 个CPU核心", runtime.GOMAXPROCS(0))
+	log.Printf("🔧 多核优化已启用，保留运行时核心策略（GOMAXPROCS=%d）", runtime.GOMAXPROCS(0))
 
 	if err := app.Run(); err != nil {
 		log.Fatalf("服务器启动失败: %v", err)

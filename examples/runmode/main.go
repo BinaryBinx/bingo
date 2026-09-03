@@ -65,7 +65,6 @@ func main() {
 				"超时优化: 读取15s, 写入15s, 空闲30s",
 				"缓冲区优化: 读取8KB, 写入8KB",
 				"并发优化: 最大连接50,000",
-				"工作协程: 每核心8个",
 				"请求体限制: 16MB",
 				"日志级别: warn",
 			},
@@ -91,7 +90,6 @@ func main() {
 		app.GetMultiCoreConfig().ReadBufferSize/1024,
 		app.GetMultiCoreConfig().WriteBufferSize/1024)
 	log.Printf("   • 并发优化: 最大连接%d", app.GetMultiCoreConfig().MaxConns)
-	log.Printf("   • 工作协程: 每核心%d个", app.GetMultiCoreConfig().WorkersPerCore)
 	log.Printf("   • 请求体限制: %dMB", app.GetMaxRequestBodySize()/(1024*1024))
 	log.Printf("   • 日志级别: %s", app.GetLogLevel())
 	log.Printf("   • 服务器名称: %s", app.GetServerName())

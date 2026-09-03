@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -48,6 +51,12 @@ type App struct {
 	// handler 是中间件链应用后的最终处理器，读取频率极高（每请求），
 	// 使用 atomic.Pointer 避免每请求加锁
 	handler atomic.Pointer[fasthttp.RequestHandler]
+	// runMode 原子保存运行模式，避免请求处理路径与 Set/GetRunMode 并发读写 data race
+	runMode atomic.Pointer[RunMode]
+	// shutdownCh 在优雅关闭完成时关闭，用于通知 Run 返回
+	shutdownCh chan struct{}
+	// shutdownOnce 保证 shutdownCh 只关闭一次
+	shutdownOnce sync.Once
 }
 
 // Config 应用配置
@@ -134,7 +143,10 @@ func NewApp(config *Config) *App {
 		ctx:         ctx,
 		cancel:      cancel,
 		logger:      logger,
+		shutdownCh:  make(chan struct{}),
 	}
+	mode := config.RunMode
+	app.runMode.Store(&mode)
 
 	handler := app.applyMiddleware(app.router.Handler)
 	app.handler.Store(&handler)
@@ -238,14 +250,13 @@ func applyMultiCoreOptimization(config *Config) {
 		return
 	}
 
-	// 设置CPU核心数
+	// 仅在显式指定正数时覆盖 GOMAXPROCS；NumCPU==0 保留运行时现有调度策略
+	// （Go 1.21+ 会按 Linux cgroup 配额自动调整，显式调用反而会关闭自动更新）
 	if config.MultiCore.NumCPU > 0 {
 		runtime.GOMAXPROCS(config.MultiCore.NumCPU)
 		logf("🔧 多核优化: 使用 %d 个CPU核心", config.MultiCore.NumCPU)
 	} else {
-		numCPU := runtime.NumCPU()
-		runtime.GOMAXPROCS(numCPU)
-		logf("🔧 多核优化: 使用所有 %d 个CPU核心", numCPU)
+		logf("🔧 多核优化: 保留运行时现有核心调度策略")
 	}
 
 	// 注意：fasthttp 内部自带 worker pool，WorkersPerCore 与 CPU 亲和性
@@ -406,19 +417,12 @@ var requestContextPool = sync.Pool{
 // wrapHandler 包装请求处理器
 func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
-		reqCtx := requestContextPool.Get().(*RequestContext)
+		reqCtx := acquireRequestContext()
 		reqCtx.RequestCtx = ctx
 		reqCtx.app = app
 		// 仅在需要记录请求日志时记录起始时间，避免 release 模式下无谓开销
-		if app.config.RunMode == RunModeDebug {
+		if app.currentRunMode() == RunModeDebug {
 			reqCtx.startTime = time.Now()
-		}
-
-		// 清理上一请求残留的路径参数；无参数时跳过空循环
-		if len(reqCtx.params) > 0 {
-			for k := range reqCtx.params {
-				delete(reqCtx.params, k)
-			}
 		}
 
 		app.parseParams(reqCtx)
@@ -426,20 +430,29 @@ func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					reqCtx.SetStatusCode(500)
-					reqCtx.SetBodyString("Internal Server Error")
-					app.logger.Error("panic recovered in handler: %v", r)
+					// 重建 500 响应并清理旧实体相关头，避免客户端按残留的
+					// Content-Encoding/Content-Type 解码错误正文
+					resetErrorResponse(ctx)
+					app.logger.Error("panic recovered in handler: %v\n%s", r, debug.Stack())
 				}
 			}()
 			handler(reqCtx)
 		}()
 
-		if app.config.RunMode == RunModeDebug {
+		if app.currentRunMode() == RunModeDebug {
 			app.logRequest(reqCtx)
 		}
 
-		requestContextPool.Put(reqCtx)
+		releaseRequestContext(reqCtx)
 	}
+}
+
+// currentRunMode 原子读取当前运行模式
+func (app *App) currentRunMode() RunMode {
+	if m := app.runMode.Load(); m != nil {
+		return *m
+	}
+	return app.config.RunMode
 }
 
 // parseParams 解析URL参数
@@ -468,17 +481,24 @@ func (app *App) logRequest(reqCtx *RequestContext) {
 	)
 }
 
-// Run 启动服务器
+// Run 启动服务器并阻塞，直到收到中断信号或外部调用 Shutdown 完成。
+// 使用 net.Listen 自建监听器（net.JoinHostPort 正确处理 IPv6 地址），
+// 再交给 fasthttp Serve，避免 ListenAndServe 固定使用 tcp4
 func (app *App) Run() error {
-	addr := fmt.Sprintf("%s:%d", app.config.Host, app.config.Port)
+	addr := net.JoinHostPort(app.config.Host, strconv.Itoa(app.config.Port))
 	app.logger.Info("🚀 Bingo服务器启动在 %s", addr)
 
-	// 启动服务器
-	errCh := make(chan error, 1)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		// 启动失败：完整回收与 App 生命周期绑定的后台资源（WebSocket 清理协程等）
+		app.release()
+		return fmt.Errorf("%w: %v", ErrServerStart, err)
+	}
+
+	// 服务器退出（正常关闭或出错）都无条件上报，供 Run 判断退出时机
+	serveErrCh := make(chan error, 1)
 	go func() {
-		if err := app.server.ListenAndServe(addr); err != nil {
-			errCh <- err
-		}
+		serveErrCh <- app.Serve(ln)
 	}()
 
 	// 等待中断信号
@@ -487,30 +507,58 @@ func (app *App) Run() error {
 	defer signal.Stop(quit)
 
 	select {
-	case err := <-errCh:
-		app.cancel()
-		if errors.Is(err, fasthttp.ErrAlreadyServing) {
-			return err
+	case err := <-serveErrCh:
+		// Serve 已退出且未发生显式关闭，说明启动或运行出错
+		app.release()
+		if err == nil || errors.Is(err, fasthttp.ErrAlreadyServing) {
+			return nil
 		}
 		return fmt.Errorf("%w: %v", ErrServerStart, err)
 	case <-quit:
 		log.Println("🛑 正在关闭服务器...")
 		return app.Shutdown()
+	case <-app.shutdownCh:
+		// 外部调用 Shutdown 已完成：等待 Serve 退出后返回
+		<-serveErrCh
+		return nil
 	}
 }
 
-// Shutdown 优雅关闭服务器
+// Shutdown 优雅关闭服务器。
+// 整个退出流程共用统一的 30 秒期限：先以有限并发关闭 WebSocket 连接
+// （到期强制回收），再执行 HTTP 服务器优雅关闭；完成后关闭通知通道，
+// 让外部触发的 Run 正常返回
 func (app *App) Shutdown() error {
-	app.cancel()
-	if app.wsUpgrader != nil {
-		app.wsUpgrader.GetManager().Shutdown()
-	}
-
-	// 设置关闭超时
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	return app.server.ShutdownWithContext(ctx)
+	app.cancel()
+	if app.wsUpgrader != nil {
+		app.wsUpgrader.GetManager().Shutdown(ctx)
+	}
+
+	err := app.server.ShutdownWithContext(ctx)
+
+	app.shutdownOnce.Do(func() {
+		close(app.shutdownCh)
+	})
+	return err
+}
+
+// Serve 在已创建的监听器上提供 HTTP 服务。
+// 这是 Run 内部使用的底层方法，测试或其他需要自行管理监听器的场景也可直接调用。
+// Serve 是阻塞的，直到 listener 被关闭或发生不可恢复的错误。
+func (app *App) Serve(ln net.Listener) error {
+	return app.server.Serve(ln)
+}
+
+// release 回收与 App 生命周期绑定的后台资源（WebSocket 清理协程等）。
+// 用于启动失败等未走完整关闭流程的路径
+func (app *App) release() {
+	app.cancel()
+	if app.wsUpgrader != nil {
+		app.wsUpgrader.GetManager().Shutdown(context.Background())
+	}
 }
 
 // GetWebSocketUpgrader 获取WebSocket升级器
@@ -520,30 +568,33 @@ func (app *App) GetWebSocketUpgrader() *websocket.WebSocketUpgrader {
 
 // IsDebug 检查是否为调试模式
 func (app *App) IsDebug() bool {
-	return app.config.RunMode == RunModeDebug
+	return app.currentRunMode() == RunModeDebug
 }
 
 // IsRelease 检查是否为生产模式
 func (app *App) IsRelease() bool {
-	return app.config.RunMode == RunModeRelease
+	return app.currentRunMode() == RunModeRelease
 }
 
 // IsTest 检查是否为测试模式
 func (app *App) IsTest() bool {
-	return app.config.RunMode == RunModeTest
+	return app.currentRunMode() == RunModeTest
 }
 
-// SetRunMode 设置运行模式
+// SetRunMode 设置运行模式。
+// 运行期模式变更通过原子指针生效；config 结构视为启动前配置，
+// 运行期修改请走本方法
 func (app *App) SetRunMode(mode RunMode) {
-	app.config.RunMode = mode
+	app.runMode.Store(&mode)
 }
 
 // GetRunMode 获取当前运行模式
 func (app *App) GetRunMode() RunMode {
-	return app.config.RunMode
+	return app.currentRunMode()
 }
 
-// GetConfig 获取应用配置
+// GetConfig 获取应用配置。
+// 返回的指针仅建议在启动前读取或修改；运行期修改请使用 Set/GetRunMode 等专用方法
 func (app *App) GetConfig() *Config {
 	return app.config
 }

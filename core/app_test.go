@@ -1,7 +1,10 @@
 package core
 
 import (
+	"net"
 	"net/http"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -203,5 +206,129 @@ func TestNewAppNormalizesInvalidConfig(t *testing.T) {
 	}
 	if app.GetMultiCoreConfig().MaxConns != defaults.MultiCore.MaxConns {
 		t.Errorf("Expected normalized max conns %d, got %d", defaults.MultiCore.MaxConns, app.GetMultiCoreConfig().MaxConns)
+	}
+}
+
+// TestRunModeConcurrentAccess 并发 Set/GetRunMode 不得产生 data race（配合 -race 验证）
+func TestRunModeConcurrentAccess(t *testing.T) {
+	app := NewApp(nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 2000; j++ {
+				_ = app.GetRunMode()
+				_ = app.IsDebug()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 2000; j++ {
+				app.SetRunMode(RunModeRelease)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestServeAndExternalShutdown Serve 在外部 Shutdown 后应返回
+func TestServeAndExternalShutdown(t *testing.T) {
+	app := NewApp(nil)
+	app.SetRunMode(RunModeRelease)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- app.Serve(ln)
+	}()
+
+	// 发真实请求确认服务可用
+	deadline := time.Now().Add(3 * time.Second)
+	var resp *http.Response
+	var reqErr error
+	for time.Now().Before(deadline) {
+		resp, reqErr = http.Get("http://" + ln.Addr().String() + "/")
+		if reqErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if reqErr != nil {
+		t.Fatalf("request failed: %v", reqErr)
+	}
+	resp.Body.Close()
+
+	if err := app.Shutdown(); err != nil {
+		t.Fatalf("shutdown error: %v", err)
+	}
+
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serve returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after Shutdown")
+	}
+}
+
+// TestRunReturnsAfterExternalShutdown 外部调用 Shutdown 后，Run 应正常返回
+func TestRunReturnsAfterExternalShutdown(t *testing.T) {
+	// 探测空闲端口
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	config := DefaultConfig()
+	config.Host = "127.0.0.1"
+	config.Port = port
+	config.RunMode = RunModeRelease
+	app := NewApp(config)
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- app.Run()
+	}()
+
+	// 等待服务器启动后外部触发关闭
+	deadline := time.Now().Add(3 * time.Second)
+	var clientErr error
+	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/"
+	for time.Now().Before(deadline) {
+		var resp *http.Response
+		resp, clientErr = http.Get(url)
+		if clientErr == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if clientErr != nil {
+		// 无法连通时仍尝试关闭，避免遗留进程
+		_ = app.Shutdown()
+		t.Fatalf("server did not start: %v", clientErr)
+	}
+
+	if err := app.Shutdown(); err != nil {
+		t.Fatalf("shutdown error: %v", err)
+	}
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after external Shutdown")
 	}
 }

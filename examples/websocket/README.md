@@ -14,7 +14,7 @@
 
 ### 2. 架构优化
 - ✅ 模块化设计，代码结构清晰
-- ✅ 使用Bingo框架的WebSocket管理
+- ✅ 使用 fasthttp 原生 WebSocket 升级（FastHTTPUpgrader）
 - ✅ 统一的错误处理和日志记录
 - ✅ 支持框架的配置系统
 
@@ -74,18 +74,27 @@ app.GET("/ws", func(ctx *core.RequestContext) {
 
 ### 3. WebSocket处理
 
+示例使用 fasthttp 原生升级路径（`github.com/fasthttp/websocket` 的 `FastHTTPUpgrader`），
+在 hijacked 连接的 goroutine 中运行业务：
+
 ```go
 func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
-    // 使用Bingo框架的WebSocket升级器
-    conn, err := cr.app.GetWebSocketUpgrader().Upgrade(adapter, adapter.Request())
-    if err != nil {
-        log.Printf("WebSocket升级失败: %v", err)
-        return
-    }
-    
-    // 处理WebSocket连接...
+	err := cr.upgrader.Upgrade(ctx.RequestCtx, cr.handleConn)
+	if err != nil {
+		log.Printf("WebSocket升级失败: %v", err)
+	}
+}
+
+// handleConn 在升级完成的连接上运行消息循环（升级成功后必须显式关闭连接）
+func (cr *ChatRoom) handleConn(conn *websocket.Conn) {
+	defer conn.Close()
+	// ... 接收 / 广播消息
 }
 ```
+
+> 注意：Bingo 的 `websocket` 包（`NewWebSocketUpgrader`/`Upgrade`）基于 net/http 风格
+> 接口，适合与标准库 http.Server 配合；在 fasthttp 服务器内请使用本示例的
+> `FastHTTPUpgrader` 路径。
 
 ## 技术特性
 
@@ -172,7 +181,7 @@ curl http://localhost:8080/ws
 ### 常见问题
 
 1. **编译错误**
-   - 确保Go版本 >= 1.19
+   - 确保Go版本 >= 1.26.5（与 go.mod 一致）
    - 检查依赖是否正确安装
    - 确认模块路径正确
 
@@ -189,9 +198,8 @@ curl http://localhost:8080/ws
 ### 调试技巧
 
 1. **启用详细日志**
-```go
-log.SetLevel(log.DebugLevel)
-```
+   - 框架日志级别在配置中调整：`config.LogLevel = "debug"`
+   - 标准库 log 没有 SetLevel/DebugLevel API，请勿使用
 
 2. **使用浏览器开发者工具**
    - Network标签查看WebSocket连接

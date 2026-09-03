@@ -29,12 +29,16 @@ func BenchmarkHandleRequest(b *testing.B) {
 }
 
 // BenchmarkHandleRequestWithParams 基准测试：带路径参数的完整请求处理
+// 注意：路由参数语法为 {param}（fasthttp/router），旧版 :id 实际返回 404、
+// handler 从未执行，不构成参数路由基准
 func BenchmarkHandleRequestWithParams(b *testing.B) {
 	config := DefaultConfig()
 	config.RunMode = RunModeRelease
 	app := NewApp(config)
 
-	app.GET("/users/:id", func(ctx *RequestContext) {
+	var paramValue string
+	app.GET("/users/{id}", func(ctx *RequestContext) {
+		paramValue = ctx.GetParam("id")
 		ctx.String(200, "%s", ctx.GetParam("id"))
 	})
 
@@ -47,6 +51,12 @@ func BenchmarkHandleRequestWithParams(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		reqCtx.Response.Reset()
 		app.handleRequest(reqCtx)
+	}
+	if reqCtx.Response.StatusCode() != 200 {
+		b.Fatalf("expected status 200, got %d", reqCtx.Response.StatusCode())
+	}
+	if paramValue != "12345" {
+		b.Fatalf("expected handler to run with id=12345, got %q", paramValue)
 	}
 }
 

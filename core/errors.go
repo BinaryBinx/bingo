@@ -39,6 +39,11 @@ func (e *AppError) Error() string {
 	return fmt.Sprintf("%s: %v", e.Message, e.Err)
 }
 
+// Unwrap 暴露内部错误，支持 errors.Is / errors.As 错误链遍历
+func (e *AppError) Unwrap() error {
+	return e.Err
+}
+
 // NewAppError 创建新的应用错误
 func NewAppError(err error, message string, code int) *AppError {
 	return &AppError{
