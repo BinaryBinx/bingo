@@ -3,182 +3,154 @@ package core
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 )
 
-// LoadConfig 从文件加载配置
+// LoadConfig 从 JSON 文件加载配置；文件未提供的字段保留默认值。
+// 时间字段沿用 time.Duration 的 JSON 表示，单位为纳秒。
 func LoadConfig(filePath string) (*Config, error) {
-	// 读取文件内容
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read configuration %q: %w", filePath, err)
 	}
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return nil, fmt.Errorf("%w: null config", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: configuration must be a JSON object", ErrInvalidConfig)
 	}
-
-	// 创建默认配置
 	config := DefaultConfig()
-
-	// 根据文件扩展名选择解析方式
-	ext := strings.ToLower(filepath.Ext(filePath))
-	switch ext {
-	case ".json":
-		err = json.Unmarshal(data, config)
-	default:
-		err = json.Unmarshal(data, config)
+	if err := json.Unmarshal(data, config); err != nil {
+		return nil, fmt.Errorf("%w: decode configuration %q: %w", ErrInvalidConfig, filePath, err)
 	}
-
-	if err != nil {
-		return nil, err
-	}
-
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
 	return config, nil
 }
 
-// SaveConfig 保存配置到文件。
-// 先写入同目录临时文件再原子替换，避免写坏已有配置
+// SaveConfig 将配置完整写入同目录的临时文件，同步并关闭后再替换目标文件。
+// 替换失败时保留旧文件并清理临时文件；已有文件的权限会被保留。
 func SaveConfig(config *Config, filePath string) error {
 	if err := config.Validate(); err != nil {
 		return err
 	}
-	// 根据文件扩展名选择序列化方式
-	ext := strings.ToLower(filepath.Ext(filePath))
-	var data []byte
-	var err error
-
-	switch ext {
-	case ".json":
-		data, err = json.MarshalIndent(config, "", "  ")
-	default:
-		data, err = json.MarshalIndent(config, "", "  ")
-	}
-
+	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("encode configuration: %w", err)
 	}
 	data = append(data, '\n')
-
-	// 确保目录存在
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("create configuration directory: %w", err)
 	}
-
-	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	mode := os.FileMode(0600)
+	if info, err := os.Stat(filePath); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%w: configuration target %q is not a regular file", ErrInvalidConfig, filePath)
+		}
+		mode = info.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect configuration target: %w", err)
+	}
+	file, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".tmp-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temporary configuration: %w", err)
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
+	tempPath := file.Name()
+	defer func() {
+		file.Close()
+		// Windows 拒绝删除只读文件；继承只读权限后替换失败也必须能清理临时文件。
+		os.Chmod(tempPath, 0600)
+		os.Remove(tempPath)
+	}()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write temporary configuration: %w", err)
 	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+	if err := file.Chmod(mode); err != nil {
+		return fmt.Errorf("set configuration permissions: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
-		return err
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync temporary configuration: %w", err)
 	}
-
-	return os.Rename(tmpName, filePath)
-}
-
-// LoadConfigFromEnv 从环境变量加载配置。
-// 环境变量解析失败时返回带字段信息的错误，而不是静默忽略
-func LoadConfigFromEnv(config *Config) error {
-	if config == nil {
-		return errors.New("LoadConfigFromEnv: config is nil")
+	// Windows 不允许依赖一个仍打开的临时文件完成替换，因此先检查 Close 的错误。
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close temporary configuration: %w", err)
 	}
-	original := config
-	copyConfig := *config
-	config = &copyConfig
-
-	if host := os.Getenv("BINGO_HOST"); host != "" {
-		config.Host = host
+	if err := replaceConfigFile(tempPath, filePath); err != nil {
+		return fmt.Errorf("replace configuration %q: %w", filePath, err)
 	}
-
-	if port := os.Getenv("BINGO_PORT"); port != "" {
-		p, err := strconv.Atoi(port)
-		if err != nil {
-			return fmt.Errorf("LoadConfigFromEnv: invalid BINGO_PORT %q: %w", port, err)
-		}
-		config.Port = p
-	}
-
-	if runMode := os.Getenv("BINGO_RUN_MODE"); runMode != "" {
-		config.RunMode = RunMode(runMode)
-	}
-
-	if logLevel := os.Getenv("BINGO_LOG_LEVEL"); logLevel != "" {
-		config.LogLevel = logLevel
-	}
-
-	if v := os.Getenv("BINGO_READ_TIMEOUT"); v != "" {
-		t, err := parseTimeoutEnv("BINGO_READ_TIMEOUT", v)
-		if err != nil {
-			return err
-		}
-		config.ReadTimeout = t
-	}
-
-	if v := os.Getenv("BINGO_WRITE_TIMEOUT"); v != "" {
-		t, err := parseTimeoutEnv("BINGO_WRITE_TIMEOUT", v)
-		if err != nil {
-			return err
-		}
-		config.WriteTimeout = t
-	}
-
-	if v := os.Getenv("BINGO_IDLE_TIMEOUT"); v != "" {
-		t, err := parseTimeoutEnv("BINGO_IDLE_TIMEOUT", v)
-		if err != nil {
-			return err
-		}
-		config.IdleTimeout = t
-	}
-
-	if maxBodySize := os.Getenv("BINGO_MAX_BODY_SIZE"); maxBodySize != "" {
-		s, err := strconv.Atoi(maxBodySize)
-		if err != nil {
-			return fmt.Errorf("LoadConfigFromEnv: invalid BINGO_MAX_BODY_SIZE %q: %w", maxBodySize, err)
-		}
-		config.MaxRequestBodySize = s
-	}
-
-	if serverName := os.Getenv("BINGO_SERVER_NAME"); serverName != "" {
-		config.ServerName = serverName
-	}
-
-	if err := config.Validate(); err != nil {
-		return err
-	}
-	*original = *config
 	return nil
 }
 
-// parseTimeoutEnv 解析秒为单位的超时环境变量
-func parseTimeoutEnv(name, value string) (time.Duration, error) {
-	seconds, err := strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("LoadConfigFromEnv: invalid %s %q: %w", name, value, err)
+// LoadConfigFromEnv 从环境变量加载配置。超时单位为秒，0 表示禁用该超时。
+// 所有字段验证通过后才写回 config，防止失败时留下半更新状态。
+func LoadConfigFromEnv(config *Config) error {
+	if config == nil {
+		return fmt.Errorf("%w: configuration is nil", ErrInvalidConfig)
 	}
-	if seconds < 0 || seconds > int64((1<<63-1)/time.Second) {
-		return 0, fmt.Errorf("%w: %s out of range", ErrInvalidConfig, name)
+	next := *config
+	if host := os.Getenv("BINGO_HOST"); host != "" {
+		next.Host = host
 	}
-	return time.Duration(seconds) * time.Second, nil
+	if raw := os.Getenv("BINGO_PORT"); raw != "" {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			return invalidEnvValue("BINGO_PORT", "must be an integer between 1 and 65535")
+		}
+		next.Port = port
+	}
+	if runMode := os.Getenv("BINGO_RUN_MODE"); runMode != "" {
+		switch RunMode(runMode) {
+		case RunModeDebug, RunModeRelease, RunModeTest:
+			next.RunMode = RunMode(runMode)
+		default:
+			return invalidEnvValue("BINGO_RUN_MODE", "must be debug, release, or test")
+		}
+	}
+	if level := os.Getenv("BINGO_LOG_LEVEL"); level != "" {
+		if !isKnownLogLevel(level) {
+			return invalidEnvValue("BINGO_LOG_LEVEL", "must be debug, info, warn, error, or fatal")
+		}
+		next.LogLevel = level
+	}
+	for _, field := range []struct {
+		name string
+		dest *time.Duration
+	}{
+		{"BINGO_READ_TIMEOUT", &next.ReadTimeout},
+		{"BINGO_WRITE_TIMEOUT", &next.WriteTimeout},
+		{"BINGO_IDLE_TIMEOUT", &next.IdleTimeout},
+	} {
+		if raw := os.Getenv(field.name); raw != "" {
+			seconds, err := strconv.ParseInt(raw, 10, 64)
+			// 检查乘法前的上限，避免大数乘 time.Second 溢出为错误的超时值。
+			if err != nil || seconds < 0 || seconds > int64((1<<63-1)/time.Second) {
+				return invalidEnvValue(field.name, "must be a non-negative integer number of seconds within time.Duration range")
+			}
+			*field.dest = time.Duration(seconds) * time.Second
+		}
+	}
+	if raw := os.Getenv("BINGO_MAX_BODY_SIZE"); raw != "" {
+		size, err := strconv.Atoi(raw)
+		if err != nil || size <= 0 {
+			return invalidEnvValue("BINGO_MAX_BODY_SIZE", "must be a positive integer number of bytes")
+		}
+		next.MaxRequestBodySize = size
+	}
+	if name := os.Getenv("BINGO_SERVER_NAME"); name != "" {
+		next.ServerName = name
+	}
+	if err := next.Validate(); err != nil {
+		return err
+	}
+	*config = next
+	return nil
+}
+
+func invalidEnvValue(name, message string) error {
+	return fmt.Errorf("%w: %s %s", ErrInvalidConfig, name, message)
 }
 
 // Validate is shared by file/environment loading and checked construction.

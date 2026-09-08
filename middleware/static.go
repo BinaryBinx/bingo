@@ -3,6 +3,7 @@ package middleware
 import (
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 
 // StaticConfig controls file snapshots. Defaults: 1000 entries, 64 MiB total,
 // 1 MiB per file and one minute retention. File metadata is rechecked on each hit.
+// TTL < 0 disables snapshot caching. GET supports If-Modified-Since; HEAD avoids reads.
 type StaticConfig struct {
 	MaxEntries    int
 	MaxBytes      int64
@@ -40,7 +42,7 @@ func StaticWithConfig(root string, cfg StaticConfig) func(fasthttp.RequestHandle
 	if cfg.MaxEntryBytes <= 0 {
 		cfg.MaxEntryBytes = 1 << 20
 	}
-	if cfg.TTL <= 0 {
+	if cfg.TTL == 0 {
 		cfg.TTL = time.Minute
 	}
 	// Leave room for the sentinel byte and avoid overflowing LimitReader's limit.
@@ -76,6 +78,9 @@ func StaticWithConfig(root string, cfg StaticConfig) func(fasthttp.RequestHandle
 				return
 			}
 			contentType := mime.TypeByExtension(filepath.Ext(name))
+			if staticMetadata(ctx, info, contentType) {
+				return
+			}
 			if item, ok := cache.get(name, time.Now()); ok && item.size == info.Size() && item.modTime.Equal(info.ModTime()) {
 				if contentType != "" {
 					ctx.SetContentType(contentType)
@@ -97,8 +102,9 @@ func StaticWithConfig(root string, cfg StaticConfig) func(fasthttp.RequestHandle
 				next(ctx)
 				return
 			}
-			if contentType != "" {
-				ctx.SetContentType(contentType)
+			if staticMetadata(ctx, info, contentType) {
+				f.Close()
+				return
 			}
 			data, streamed, err := staticBody(ctx, f, info, cfg.MaxEntryBytes)
 			if err != nil {
@@ -140,4 +146,27 @@ func staticBody(ctx *fasthttp.RequestCtx, f *os.File, info os.FileInfo, limit in
 	}
 	err = f.Close()
 	return data, false, err
+}
+
+// HTTP dates have one-second resolution. If-None-Match takes precedence over
+// If-Modified-Since; this handler does not synthesize an ETag.
+func staticMetadata(ctx *fasthttp.RequestCtx, info os.FileInfo, contentType string) bool {
+	if contentType != "" {
+		ctx.SetContentType(contentType)
+	}
+	ctx.Response.Header.Set("Last-Modified", info.ModTime().UTC().Format(http.TimeFormat))
+	if values := ctx.Request.Header.PeekAll("If-Modified-Since"); len(values) == 1 && len(ctx.Request.Header.Peek("If-None-Match")) == 0 {
+		if since, err := http.ParseTime(string(values[0])); err == nil && !info.ModTime().Truncate(time.Second).After(since) {
+			ctx.Response.ResetBody()
+			ctx.SetStatusCode(fasthttp.StatusNotModified)
+			return true
+		}
+	}
+	if ctx.IsHead() {
+		ctx.Response.ResetBody()
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		ctx.Response.Header.SetContentLength(int(info.Size()))
+		return true
+	}
+	return false
 }

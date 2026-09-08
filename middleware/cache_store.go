@@ -6,25 +6,27 @@ import (
 	"time"
 )
 
-// boundedCache owns immutable snapshots. Expiry order also provides bounded-cost
-// eviction: no request scans the entire map to find an eviction candidate.
+// boundedCache owns immutable snapshots. LRU links select eviction candidates;
+// an expiry heap removes stale entries without scanning the entire map.
 // The one-shot expiry timer stops when empty; no permanent cleanup goroutine is used.
 type boundedCache[K comparable, V any] struct {
-	mu         sync.Mutex
-	items      map[K]*cacheEntry[K, V]
-	expiry     entryHeap[K, V]
-	bytes      int64
-	maxBytes   int64
-	maxEntries int
-	timer      *time.Timer
+	mu             sync.Mutex
+	items          map[K]*cacheEntry[K, V]
+	expiry         entryHeap[K, V]
+	newest, oldest *cacheEntry[K, V]
+	bytes          int64
+	maxBytes       int64
+	maxEntries     int
+	timer          *time.Timer
 }
 
 type cacheEntry[K comparable, V any] struct {
-	key     K
-	value   V
-	cost    int64
-	expires time.Time
-	index   int
+	key          K
+	value        V
+	cost         int64
+	expires      time.Time
+	index        int
+	newer, older *cacheEntry[K, V]
 }
 
 type entryHeap[K comparable, V any] []*cacheEntry[K, V]
@@ -51,6 +53,7 @@ func newBoundedCache[K comparable, V any](entries int, bytes int64) *boundedCach
 }
 
 func (c *boundedCache[K, V]) remove(e *cacheEntry[K, V]) {
+	c.unlink(e)
 	delete(c.items, e.key)
 	c.bytes -= e.cost
 	heap.Remove(&c.expiry, e.index)
@@ -61,9 +64,12 @@ func (c *boundedCache[K, V]) get(key K, now time.Time) (V, bool) {
 	defer c.mu.Unlock()
 	if e, ok := c.items[key]; ok {
 		if now.Before(e.expires) {
+			c.unlink(e)
+			c.touch(e)
 			return e.value, true
 		}
 		c.remove(e)
+		c.scheduleExpiry()
 	}
 	var zero V
 	return zero, false
@@ -79,7 +85,7 @@ func (c *boundedCache[K, V]) delete(key K) {
 }
 
 func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) {
-	if cost <= 0 || cost > c.maxBytes || !time.Now().Before(expires) {
+	if c.maxEntries <= 0 || cost <= 0 || cost > c.maxBytes || !time.Now().Before(expires) {
 		return
 	}
 	c.mu.Lock()
@@ -88,10 +94,11 @@ func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) 
 		c.remove(old)
 	}
 	for len(c.items) >= c.maxEntries || cost > c.maxBytes-c.bytes {
-		c.remove(c.expiry[0])
+		c.remove(c.oldest)
 	}
 	e := &cacheEntry[K, V]{key: key, value: value, cost: cost, expires: expires}
 	c.items[key] = e
+	c.touch(e)
 	c.bytes += cost
 	heap.Push(&c.expiry, e)
 	c.scheduleExpiry()
@@ -121,4 +128,28 @@ func (c *boundedCache[K, V]) expire() {
 		c.remove(c.expiry[0])
 	}
 	c.scheduleExpiry()
+}
+
+// Intrusive links keep cache hits allocation-free while retaining recently used entries.
+func (c *boundedCache[K, V]) unlink(e *cacheEntry[K, V]) {
+	if e.newer != nil {
+		e.newer.older = e.older
+	} else {
+		c.newest = e.older
+	}
+	if e.older != nil {
+		e.older.newer = e.newer
+	} else {
+		c.oldest = e.newer
+	}
+	e.newer, e.older = nil, nil
+}
+func (c *boundedCache[K, V]) touch(e *cacheEntry[K, V]) {
+	e.older = c.newest
+	if c.newest != nil {
+		c.newest.newer = e
+	} else {
+		c.oldest = e
+	}
+	c.newest = e
 }

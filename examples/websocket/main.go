@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BinaryBinx/bingo/core"
 	"github.com/BinaryBinx/bingo/middleware"
 
 	"github.com/fasthttp/websocket"
-	"github.com/valyala/fasthttp"
 )
 
 // ChatMessage 聊天消息结构
@@ -48,8 +49,7 @@ func NewChatRoom(app *core.App) *ChatRoom {
 		// fasthttp 原生升级器：在回调中交付升级完成的连接，全程可运行
 		upgrader: websocket.FastHTTPUpgrader{
 			EnableCompression: true,
-			// 示例放开跨域限制；生产环境应校验 Origin
-			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool { return true },
+			// nil CheckOrigin uses the upgrader's same-origin policy.
 		},
 	}
 	if err := app.OnShutdown(room.Shutdown); err != nil {
@@ -203,6 +203,19 @@ func (cr *ChatRoom) handleConn(raw *websocket.Conn, transport net.Conn) {
 			continue
 		}
 
+		if msg.Type == "ping" {
+			if err := conn.WriteMessage(websocket.TextMessage, mustMarshalJS(ChatMessage{Type: "pong", Timestamp: time.Now()})); err != nil {
+				return
+			}
+			continue
+		}
+		if msg.Type != "message" {
+			continue
+		}
+		msg.Message = strings.TrimSpace(msg.Message)
+		if msg.Message == "" || utf8.RuneCountInString(msg.Message) > 500 {
+			continue
+		}
 		// 设置消息属性
 		msg.Username = username
 		msg.Timestamp = time.Now()
@@ -602,6 +615,9 @@ const chatRoomHTML = `
         const maxReconnectAttempts = 5;
         // 限制聊天记录条数，避免长时间使用 DOM 无限增长
         const maxMessages = 200;
+        let heartbeatTimer = null;
+        let reconnectTimer = null;
+        let leavingPage = false;
 
         // DOM元素
         const chatMessages = document.getElementById('chatMessages');
@@ -622,21 +638,29 @@ const chatRoomHTML = `
                 reconnectAttempts = 0;
                 statusIndicator.classList.add('connected');
                 addSystemMessage('连接成功！');
+                clearInterval(heartbeatTimer);
+                heartbeatTimer = setInterval(function() {
+                    if (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount <= 65536) ws.send(JSON.stringify({type: 'ping'}));
+                }, 20000);
             };
 
             ws.onmessage = function(event) {
-                const message = JSON.parse(event.data);
+                let message;
+                try { message = JSON.parse(event.data); } catch { return; }
+                if (!message || message.type === 'pong') return;
                 displayMessage(message);
             };
 
             ws.onclose = function() {
+                clearInterval(heartbeatTimer);
                 isConnected = false;
                 statusIndicator.classList.remove('connected');
+                if (leavingPage) return;
                 addSystemMessage('连接断开，正在重连...');
 
                 if (reconnectAttempts < maxReconnectAttempts) {
                     reconnectAttempts++;
-                    setTimeout(connectWebSocket, 2000);
+                    reconnectTimer = setTimeout(connectWebSocket, 2000);
                 } else {
                     addSystemMessage('重连失败，请刷新页面重试。');
                 }
@@ -718,7 +742,8 @@ const chatRoomHTML = `
         // 发送消息
         function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message || !isConnected) return;
+            if (!message || !isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
+            if (ws.bufferedAmount > 65536) { addSystemMessage('网络繁忙，请稍后再发送。'); return; }
 
             const messageData = {
                 type: 'message',
@@ -757,6 +782,9 @@ const chatRoomHTML = `
 
         // 页面卸载时关闭连接
         window.addEventListener('beforeunload', function() {
+            leavingPage = true;
+            clearInterval(heartbeatTimer);
+            clearTimeout(reconnectTimer);
             if (ws) {
                 ws.close();
             }

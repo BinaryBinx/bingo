@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,16 +19,18 @@ type CacheConfig struct {
 	MaxEntryBytes int64
 }
 
-type responseCacheKey struct{ host, uri, encoding, origin string }
+type responseCacheKey struct{ host, uri, encoding, origin, variant string }
 type cacheHeader struct {
 	key, value  string
 	appendValue bool
 }
 type responseSnapshot struct {
-	body    []byte
-	headers []cacheHeader
-	stored  time.Time
-	age     time.Duration
+	body      []byte
+	headers   []cacheHeader
+	stored    time.Time
+	age       time.Duration
+	vary      []string // A schema index, sharing the same bounded store as response bodies.
+	requestID bool
 }
 
 // Cache caches public GET responses for at most duration. Default bounds are
@@ -56,11 +59,18 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 				next(ctx)
 				return
 			}
+			guard := guardResponse(ctx)
 			key := responseCacheKey{string(ctx.Host()), string(ctx.RequestURI()),
 				strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
-				string(ctx.Request.Header.Peek("Origin"))}
+				string(ctx.Request.Header.Peek("Origin")), ""}
 			started := time.Now()
-			if item, ok := cache.get(key, started); ok {
+			item, ok := cache.get(key, started)
+			if ok && len(item.vary) != 0 {
+				variant := key
+				variant.variant = cacheVariant(item.vary, &ctx.Request.Header)
+				item, ok = cache.get(variant, started)
+			}
+			if ok {
 				ctx.Response.ResetBody()
 				ctx.SetStatusCode(fasthttp.StatusOK)
 				ctx.SetBody(item.body)
@@ -74,21 +84,36 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 					}
 				}
 				ctx.Response.Header.Set("Age", strconv.FormatInt(int64((item.age+started.Sub(item.stored))/time.Second), 10))
+				if item.requestID && len(ctx.Response.Header.Peek("X-Request-ID")) == 0 {
+					ctx.Response.Header.Set("X-Request-ID", generateRequestID())
+				}
 				ctx.Response.Header.Set("X-Cache", "HIT")
 				return
 			}
+			// A handler can change request headers. Select representations from
+			// the original request, including repeated and empty field lines.
+			var requestHeaders fasthttp.RequestHeader
+			ctx.Request.Header.CopyTo(&requestHeaders)
 			next(ctx)
+			if guard.abandoned(ctx) || ctx.Hijacked() {
+				return
+			}
 			if ctx.Response.StatusCode() != fasthttp.StatusOK || ctx.Response.IsBodyStream() {
 				return
 			}
 			now := time.Now()
 			ttl, age := responseFreshness(&ctx.Response.Header, cfg.Duration, started, now)
-			if ttl <= 0 {
+			vary, cacheable := cacheVaryFields(&ctx.Response.Header)
+			if ttl <= 0 || !cacheable {
 				cache.delete(key)
 				return
 			}
+			variant := key
+			if len(vary) != 0 {
+				variant.variant = cacheVariant(vary, &requestHeaders)
+			}
 			body := ctx.Response.Body()
-			cost := int64(len(body) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + 256)
+			cost := int64(len(body) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + len(variant.variant) + 288)
 			if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
 				return
 			}
@@ -106,8 +131,22 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 			if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
 				return
 			}
-			item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age}
-			cache.put(key, item, cost, now.Add(ttl))
+			item = responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
+			if len(vary) != 0 {
+				indexCost := int64(len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + 288)
+				for _, field := range vary {
+					indexCost += int64(len(field) + 16)
+				}
+				if cfg.MaxEntries < 2 || indexCost > cfg.MaxEntryBytes || cost > cfg.MaxBytes-indexCost {
+					return
+				}
+				// Including the schema in variant keys makes concurrent schema changes safe.
+				// Eviction of either entry is a miss; no auxiliary unbounded index is retained.
+				cache.put(variant, item, cost, now.Add(ttl))
+				cache.put(key, responseSnapshot{vary: vary}, indexCost, now.Add(ttl))
+			} else {
+				cache.put(key, item, cost, now.Add(ttl))
+			}
 			ctx.Response.Header.Set("X-Cache", "MISS")
 		}
 	}
@@ -171,14 +210,6 @@ func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started,
 	for _, name := range []string{"private", "no-store", "no-cache"} {
 		if len(d[name]) > 0 {
 			return 0, 0
-		}
-	}
-	for _, line := range h.PeekAll("Vary") {
-		for _, v := range strings.Split(strings.ToLower(string(line)), ",") {
-			v = strings.TrimSpace(v)
-			if v != "accept-encoding" && v != "origin" {
-				return 0, 0
-			}
 		}
 	}
 	age := time.Duration(0)
@@ -268,4 +299,49 @@ func hasHeaderValue(values [][]byte) bool {
 		}
 	}
 	return false
+}
+
+// Common encoding/origin dimensions stay in the allocation-free base key.
+// Other valid Vary fields use a bounded schema index only when requested by the origin.
+func cacheVaryFields(h *fasthttp.ResponseHeader) ([]string, bool) {
+	var fields []string
+	for _, line := range h.PeekAll("Vary") {
+		for _, raw := range strings.Split(string(line), ",") {
+			field := strings.ToLower(strings.TrimSpace(raw))
+			if field == "" {
+				continue
+			}
+			if field == "*" || hopByHop(field) {
+				return nil, false
+			}
+			for _, c := range field {
+				if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", c)) {
+					return nil, false
+				}
+			}
+			if field != "accept-encoding" && field != "origin" && !slices.Contains(fields, field) {
+				fields = append(fields, field)
+			}
+		}
+	}
+	slices.Sort(fields)
+	return fields, true
+}
+func cacheVariant(fields []string, h *fasthttp.RequestHeader) string {
+	var key strings.Builder
+	frame := func(value string) {
+		key.WriteString(strconv.Itoa(len(value)))
+		key.WriteByte(':')
+		key.WriteString(value)
+	}
+	for _, field := range fields {
+		frame(field)
+		h.VisitAll(func(k, v []byte) {
+			if strings.EqualFold(string(k), field) {
+				frame(string(v))
+			}
+		})
+		key.WriteByte(';')
+	}
+	return key.String()
 }

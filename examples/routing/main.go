@@ -25,7 +25,8 @@ type Product struct {
 
 func main() {
 	// 创建应用实例
-	app := core.NewApp(nil)
+	config := core.DefaultConfig()
+	app := core.NewApp(config)
 
 	// 1. 基础路径参数路由
 	app.GET("/", func(ctx *core.RequestContext) {

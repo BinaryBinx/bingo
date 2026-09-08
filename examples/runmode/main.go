@@ -9,10 +9,11 @@ import (
 )
 
 func main() {
-	log.Println("🎯 运行模式示例 - 展示不同模式下的行为差异")
+	log.Println("🎯 运行模式示例 - 启动一个生产模式服务")
 
 	// 创建生产模式配置
 	config := core.ProductionConfig()
+	config.RunMode = core.RunModeRelease
 	config.Host = "0.0.0.0"
 	config.Port = 8080
 
@@ -27,12 +28,12 @@ func main() {
 	// 注册路由
 	app.GET("/", func(ctx *core.RequestContext) {
 		ctx.JSON(200, map[string]interface{}{
-			"message":   "欢迎使用Bingo框架",
-			"run_mode":  app.GetRunMode(),
-			"timestamp": time.Now().Unix(),
-			"server":    app.GetServerName(),
-			"log_level": app.GetLogLevel(),
-			"optimized": "生产环境优化已启用",
+			"message":         "欢迎使用Bingo框架",
+			"run_mode":        app.GetRunMode(),
+			"timestamp":       time.Now().Unix(),
+			"server":          app.GetServerName(),
+			"log_level":       app.GetLogLevel(),
+			"request_logging": app.IsDebug(),
 		})
 	})
 
@@ -47,12 +48,11 @@ func main() {
 			"idle_timeout":     app.GetIdleTimeout().String(),
 			"max_request_body": app.GetMaxRequestBodySize(),
 			"multi_core": map[string]interface{}{
-				"enabled":          multiCore.Enabled,
-				"num_cpu":          multiCore.NumCPU,
-				"workers_per_core": multiCore.WorkersPerCore,
-				"max_conns":        multiCore.MaxConns,
-				"read_buffer":      multiCore.ReadBufferSize,
-				"write_buffer":     multiCore.WriteBufferSize,
+				"enabled":      multiCore.Enabled,
+				"num_cpu":      multiCore.NumCPU,
+				"max_conns":    multiCore.MaxConns,
+				"read_buffer":  multiCore.ReadBufferSize,
+				"write_buffer": multiCore.WriteBufferSize,
 			},
 		})
 	})
@@ -60,12 +60,10 @@ func main() {
 	app.GET("/performance", func(ctx *core.RequestContext) {
 		ctx.JSON(200, map[string]interface{}{
 			"message": "性能测试端点",
-			"optimizations": []string{
-				"超时优化: 读取15s, 写入15s, 空闲30s",
-				"缓冲区优化: 读取8KB, 写入8KB",
-				"并发优化: 最大连接50,000",
-				"请求体限制: 16MB",
-				"日志级别: warn",
+			"notes": []string{
+				"Release 模式关闭内置请求日志",
+				"通过 /config 查看当前实际配置",
+				"连接数、缓冲区和请求体上限需要结合内存预算与真实负载调节",
 			},
 		})
 	})
@@ -80,7 +78,7 @@ func main() {
 
 	// 启动服务器
 	log.Printf("🏭 生产模式服务器启动中...")
-	log.Printf("📊 生产环境优化包括:")
+	log.Printf("📊 当前服务器配置:")
 	log.Printf("   • 超时优化: 读取%s, 写入%s, 空闲%s",
 		app.GetReadTimeout().String(),
 		app.GetWriteTimeout().String(),

@@ -35,3 +35,12 @@ func From(ctx *fasthttp.RequestCtx) context.Context {
 }
 
 func Set(ctx *fasthttp.RequestCtx, value context.Context) { ctx.SetUserValue(contextKey{}, value) }
+
+// Timeout ownership is installed before the worker starts.
+type timeoutKey struct{}
+
+func HasTimeout(ctx *fasthttp.RequestCtx) bool { return ctx.UserValue(timeoutKey{}) != nil }
+func SetTimeout(ctx *fasthttp.RequestCtx, value context.Context) {
+	Set(ctx, value)
+	ctx.SetUserValue(timeoutKey{}, true)
+}

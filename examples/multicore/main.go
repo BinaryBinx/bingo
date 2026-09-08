@@ -10,18 +10,13 @@ import (
 )
 
 func main() {
-	// 基于默认配置覆盖字段，避免手工字面量缺失超时等默认值
+	// 创建多核优化配置
 	config := core.DefaultConfig()
-	config.Host = "0.0.0.0"
-	config.Port = 8080
-	// Release 模式避免 Debug 请求日志干扰性能测量
+	// 保留有限的读写和空闲超时；关闭默认请求日志，避免日志 I/O 干扰压测。
 	config.RunMode = core.RunModeRelease
-	config.MultiCore.Enabled = true
-	config.MultiCore.NumCPU = 0            // 0 表示保留运行时现有核心策略（含容器 cgroup 自适应）
-	config.MultiCore.MaxConns = 10000      //
-	config.MultiCore.ReadBufferSize = 8192 // 增大缓冲区
+	config.MultiCore.NumCPU = 0 // 保留 Go 运行时或 GOMAXPROCS 的设置
+	config.MultiCore.ReadBufferSize = 8192
 	config.MultiCore.WriteBufferSize = 8192
-	// WorkersPerCore / EnableCPUAffinity 为预留字段，当前版本不生效
 
 	// 创建应用实例
 	app := core.NewApp(config)
@@ -49,8 +44,8 @@ func main() {
 						<h2>系统信息</h2>
 						<p><strong>CPU核心数:</strong> %d</p>
 						<p><strong>GOMAXPROCS:</strong> %d</p>
-						<p><strong>最大并发连接:</strong> 10,000</p>
-						<p><strong>缓冲区大小:</strong> 8KB</p>
+						<p><strong>最大并发连接:</strong> %d</p>
+						<p><strong>读/写缓冲区:</strong> %d / %d 字节</p>
 					</div>
 
 					<h2>性能测试接口</h2>
@@ -70,7 +65,8 @@ ab -n 10000 -c 100 http://localhost:8080/ping
 				</div>
 			</body>
 			</html>
-		`, runtime.NumCPU(), runtime.GOMAXPROCS(0)))
+		`, runtime.NumCPU(), runtime.GOMAXPROCS(0), app.GetMultiCoreConfig().MaxConns,
+			app.GetMultiCoreConfig().ReadBufferSize, app.GetMultiCoreConfig().WriteBufferSize))
 	})
 
 	// 基础性能测试
@@ -107,8 +103,8 @@ ab -n 10000 -c 100 http://localhost:8080/ping
 	// CPU密集计算测试
 	app.GET("/compute", func(ctx *core.RequestContext) {
 		// 模拟CPU密集计算
-		result := 0
-		for i := 0; i < 1000000; i++ {
+		var result int64
+		for i := int64(0); i < 1000000; i++ {
 			result += i * i
 		}
 
@@ -146,7 +142,7 @@ ab -n 10000 -c 100 http://localhost:8080/ping
 	})
 
 	log.Printf("🚀 Bingo多核性能测试服务器启动在 %s:%d", config.Host, config.Port)
-	log.Printf("🔧 多核优化已启用，保留运行时核心策略（GOMAXPROCS=%d）", runtime.GOMAXPROCS(0))
+	log.Printf("🔧 多核优化已启用，使用 %d 个CPU核心", runtime.GOMAXPROCS(0))
 
 	if err := app.Run(); err != nil {
 		log.Fatalf("服务器启动失败: %v", err)

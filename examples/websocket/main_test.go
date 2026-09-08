@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
@@ -58,6 +60,29 @@ func TestWebSocketHandshake(t *testing.T) {
 		t.Fatalf("read second message failed: %v", err)
 	}
 	t.Logf("received: %s", data)
+	// Application heartbeats are answered privately instead of broadcast as chat.
+	if err := conn.WriteJSON(ChatMessage{Type: "ping"}); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pong ChatMessage
+	if err := json.Unmarshal(data, &pong); err != nil || pong.Type != "pong" {
+		t.Fatalf("heartbeat response=%s err=%v", data, err)
+	}
+	// The room now uses the upstream upgrader's same-origin policy.
+	foreign, response, err := websocket.DefaultDialer.Dial("ws://"+ln.Addr().String()+"/ws", http.Header{"Origin": {"https://foreign.test"}})
+	if foreign != nil {
+		foreign.Close()
+	}
+	if response != nil && response.Body != nil {
+		response.Body.Close()
+	}
+	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatal("cross-origin handshake accepted")
+	}
 	if err := app.Shutdown(); err != nil {
 		t.Fatal(err)
 	}

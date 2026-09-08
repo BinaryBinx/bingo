@@ -9,7 +9,10 @@ import (
 
 func main() {
 	// 创建应用实例
-	app := core.NewApp(nil)
+	config := core.DefaultConfig()
+	// 请求日志由 Logger 中间件负责，避免同时启用 Debug 模式内置请求日志。
+	config.RunMode = core.RunModeRelease
+	app := core.NewApp(config)
 
 	// 使用日志中间件
 	app.Use(middleware.Logger())

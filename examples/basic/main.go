@@ -14,7 +14,8 @@ type User struct {
 
 func main() {
 	// 创建应用实例
-	app := core.NewApp(nil)
+	config := core.DefaultConfig()
+	app := core.NewApp(config)
 
 	// 注册根路径路由
 	app.GET("/", func(ctx *core.RequestContext) {

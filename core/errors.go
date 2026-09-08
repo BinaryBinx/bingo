@@ -41,6 +41,9 @@ func (e *AppError) Error() string {
 
 // Unwrap 暴露内部错误，支持 errors.Is / errors.As 错误链遍历
 func (e *AppError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
 	return e.Err
 }
 
