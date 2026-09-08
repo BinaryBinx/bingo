@@ -150,22 +150,31 @@ func (c *Connection) acquire(ctx context.Context, lock chan struct{}) error {
 }
 
 func (c *Connection) operationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx := c.ctx
-	cancel := func() {}
-	stop := func() bool { return false }
-	if parent.Done() != nil {
-		ctx, cancel = context.WithCancel(parent)
-		stop = context.AfterFunc(c.ctx, cancel)
-		if c.ctx.Err() != nil {
-			cancel()
+	// Ordinary reads/writes need only the connection's own cancellation chain.
+	if parent.Done() == nil || parent == c.ctx {
+		if timeout > 0 {
+			return context.WithTimeout(c.ctx, timeout)
 		}
+		return c.ctx, noOperationCancel
 	}
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		limited, stopTimer := context.WithTimeout(ctx, timeout)
-		return limited, func() { stop(); stopTimer(); cancel() }
+		// WithTimeout already supplies cancellation and respects earlier parent
+		// deadlines. An extra WithCancel node would duplicate both allocations
+		// and propagation work for every recipient of a broadcast.
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
+	stop := context.AfterFunc(c.ctx, cancel)
+	if c.ctx.Err() != nil {
+		cancel()
 	}
 	return ctx, func() { stop(); cancel() }
 }
+
+func noOperationCancel() {}
 
 func (c *Connection) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultOperationTimeout)

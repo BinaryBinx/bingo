@@ -2,13 +2,19 @@ package middleware
 
 import (
 	"container/heap"
+	"hash/maphash"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// boundedCache owns immutable snapshots. LRU links select eviction candidates;
+const cacheShardCount = 32
+
+// boundedCache owns immutable snapshots. Second-chance links select eviction candidates;
 // an expiry heap removes stale entries without scanning the entire map.
 // The one-shot expiry timer stops when empty; no permanent cleanup goroutine is used.
+// Writers hold mu before taking a shard lock. Readers only take one shard lock;
+// global entry/byte limits therefore remain exact without serializing every hit.
 type boundedCache[K comparable, V any] struct {
 	mu             sync.Mutex
 	items          map[K]*cacheEntry[K, V]
@@ -18,6 +24,13 @@ type boundedCache[K comparable, V any] struct {
 	maxBytes       int64
 	maxEntries     int
 	timer          *time.Timer
+	seed           maphash.Seed
+	shards         [cacheShardCount]cacheShard[K, V]
+}
+
+type cacheShard[K comparable, V any] struct {
+	mu    sync.RWMutex
+	items map[K]*cacheEntry[K, V]
 }
 
 type cacheEntry[K comparable, V any] struct {
@@ -27,6 +40,7 @@ type cacheEntry[K comparable, V any] struct {
 	expires      time.Time
 	index        int
 	newer, older *cacheEntry[K, V]
+	referenced   atomic.Bool
 }
 
 type entryHeap[K comparable, V any] []*cacheEntry[K, V]
@@ -49,10 +63,18 @@ func (h *entryHeap[K, V]) Pop() any {
 }
 
 func newBoundedCache[K comparable, V any](entries int, bytes int64) *boundedCache[K, V] {
-	return &boundedCache[K, V]{items: make(map[K]*cacheEntry[K, V]), maxEntries: entries, maxBytes: bytes}
+	return &boundedCache[K, V]{items: make(map[K]*cacheEntry[K, V]), maxEntries: entries, maxBytes: bytes, seed: maphash.MakeSeed()}
+}
+
+func (c *boundedCache[K, V]) shard(key K) *cacheShard[K, V] {
+	return &c.shards[maphash.Comparable(c.seed, key)%cacheShardCount]
 }
 
 func (c *boundedCache[K, V]) remove(e *cacheEntry[K, V]) {
+	shard := c.shard(e.key)
+	shard.mu.Lock()
+	delete(shard.items, e.key)
+	shard.mu.Unlock()
 	c.unlink(e)
 	delete(c.items, e.key)
 	c.bytes -= e.cost
@@ -60,16 +82,17 @@ func (c *boundedCache[K, V]) remove(e *cacheEntry[K, V]) {
 }
 
 func (c *boundedCache[K, V]) get(key K, now time.Time) (V, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if e, ok := c.items[key]; ok {
-		if now.Before(e.expires) {
-			c.unlink(e)
-			c.touch(e)
-			return e.value, true
+	shard := c.shard(key)
+	shard.mu.RLock()
+	e := shard.items[key]
+	shard.mu.RUnlock()
+	// Published key/value/expiry fields never change, even after eviction.
+	// Once referenced, repeated hot-key hits need no atomic writes or LRU edits.
+	if e != nil && now.Before(e.expires) {
+		if !e.referenced.Load() {
+			e.referenced.Store(true)
 		}
-		c.remove(e)
-		c.scheduleExpiry()
+		return e.value, true
 	}
 	var zero V
 	return zero, false
@@ -94,10 +117,26 @@ func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) 
 		c.remove(old)
 	}
 	for len(c.items) >= c.maxEntries || cost > c.maxBytes-c.bytes {
+		// Bound the scan even when concurrent readers continuously touch entries.
+		for scanned := 0; scanned < len(c.items); scanned++ {
+			if !c.oldest.referenced.Swap(false) {
+				break
+			}
+			e := c.oldest
+			c.unlink(e)
+			c.touch(e)
+		}
 		c.remove(c.oldest)
 	}
 	e := &cacheEntry[K, V]{key: key, value: value, cost: cost, expires: expires}
 	c.items[key] = e
+	shard := c.shard(key)
+	shard.mu.Lock()
+	if shard.items == nil {
+		shard.items = make(map[K]*cacheEntry[K, V])
+	}
+	shard.items[key] = e
+	shard.mu.Unlock()
 	c.touch(e)
 	c.bytes += cost
 	heap.Push(&c.expiry, e)
@@ -130,7 +169,7 @@ func (c *boundedCache[K, V]) expire() {
 	c.scheduleExpiry()
 }
 
-// Intrusive links keep cache hits allocation-free while retaining recently used entries.
+// Links are changed only by writers; hot readers mark a second chance instead.
 func (c *boundedCache[K, V]) unlink(e *cacheEntry[K, V]) {
 	if e.newer != nil {
 		e.newer.older = e.older

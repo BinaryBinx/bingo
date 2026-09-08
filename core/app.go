@@ -333,9 +333,7 @@ func (app *App) Group(prefix string) *RouterGroup {
 
 var requestContextPool = sync.Pool{
 	New: func() interface{} {
-		return &RequestContext{
-			params: make(map[string]string),
-		}
+		return &RequestContext{}
 	},
 }
 
@@ -349,8 +347,6 @@ func (app *App) wrapHandler(handler RequestHandler) fasthttp.RequestHandler {
 		if app.currentRunMode() == RunModeDebug {
 			reqCtx.startTime = time.Now()
 		}
-
-		app.parseParams(reqCtx)
 
 		func() {
 			defer func() {
@@ -378,20 +374,6 @@ func (app *App) currentRunMode() RunMode {
 		return *m
 	}
 	return app.config.RunMode
-}
-
-// parseParams 解析URL参数
-func (app *App) parseParams(reqCtx *RequestContext) {
-	if ctx := reqCtx.RequestCtx; ctx != nil {
-		ctx.VisitUserValues(func(key []byte, value interface{}) {
-			switch v := value.(type) {
-			case string:
-				reqCtx.params[string(key)] = v
-			case []byte:
-				reqCtx.params[string(key)] = string(v)
-			}
-		})
-	}
 }
 
 // logRequest 记录请求日志

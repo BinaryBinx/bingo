@@ -67,7 +67,7 @@ func TestCORSCopiesOriginConfiguration(t *testing.T) {
 	}
 }
 
-func TestCacheLRURetainsRecentlyReadEntry(t *testing.T) {
+func TestCacheSecondChanceRetainsRecentlyReadEntry(t *testing.T) {
 	c := newBoundedCache[string, string](2, 20)
 	expires := time.Now().Add(time.Minute)
 	defer func() {
@@ -80,7 +80,7 @@ func TestCacheLRURetainsRecentlyReadEntry(t *testing.T) {
 	c.get("a", time.Now())
 	c.put("c", "c", 10, expires)
 	if _, ok := c.get("b", time.Now()); ok {
-		t.Fatal("least recently read entry survived eviction")
+		t.Fatal("cold entry survived eviction")
 	}
 	c.put("a", "updated", 10, expires)
 	if got, _ := c.get("a", time.Now()); got != "updated" {

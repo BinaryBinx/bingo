@@ -28,8 +28,16 @@ func (c serverContext) Err() error {
 // From provides a cooperative business context. fasthttp.RequestCtx itself only
 // signals server shutdown; timeout middleware attaches a request deadline here.
 func From(ctx *fasthttp.RequestCtx) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
 	if value, ok := ctx.UserValue(contextKey{}).(context.Context); ok {
 		return value
+	}
+	// Direct middleware calls may use a zero RequestCtx, with no Server/Done
+	// channel installed yet. Real served requests always have a connection.
+	if ctx.Conn() == nil {
+		return context.Background()
 	}
 	return serverContext{Context: context.Background(), done: ctx.Done()}
 }

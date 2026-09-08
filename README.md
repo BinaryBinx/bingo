@@ -275,7 +275,7 @@ app.GET("/ws", func(ctx *core.RequestContext) {
 
 回调返回时自动关闭连接；该升级器由 App 关闭流程管理。独立创建的升级器由调用方关闭。`Upgrade` 在 HTTP 劫持后直接向套接字写握手结果，返回错误时不要再追加 HTTP 响应。
 
-`BroadcastContext`、`BroadcastTextContext`、`BroadcastBinaryContext` 接受整个广播批次的期限并返回错误；排队也计入期限，最多 32 个发送工作协程。JSON 在批次获得发送资格后只编码一次。连接提供 `CloseWithContext`，管理器提供 `ShutdownWithContext`；到期会关闭底层连接并等待清理完成。已有 `Shutdown(ctx)` 继续保留 5 秒总上限。
+`BroadcastContext`、`BroadcastTextContext`、`BroadcastBinaryContext` 接受整个广播批次的期限并返回错误；排队也计入期限，最多 32 个发送工作协程，按需启动并在连续广播之间复用；空闲 30 秒或管理器关闭时退出，单连接广播直接执行。JSON 在批次获得发送资格后只编码一次。连接提供 `CloseWithContext`，管理器提供 `ShutdownWithContext`；到期会关闭底层连接并等待清理完成。已有 `Shutdown(ctx)` 继续保留 5 秒总上限。
 
 WebSocket 默认读写超时仍为 30 秒，设为 0 可禁用对应操作超时。连接管理器默认空闲期限为 1 小时，收到 ping/pong 也刷新活动时间；无连接时停止清理任务。聊天示例继续使用独立的有界发送队列，以隔离慢客户端。
 
@@ -319,6 +319,7 @@ app := core.NewApp(config)
 app.Use(middleware.Timeout(2 * time.Second))
 app.Use(middleware.Recovery())
 app.Use(middleware.Logger())
+// 缓存先注册，位于压缩外层：命中直接复用 gzip/identity 对应的响应。
 app.Use(middleware.CacheWithConfig(middleware.CacheConfig{
     Duration: time.Minute,
     MaxEntries: 10000,
@@ -330,7 +331,11 @@ app.Use(middleware.Compress())
 
 Timeout 超时返回 408，但不能强制终止 Go 业务函数。数据库、HTTP 等下游操作应传入 `ctx.Context()`，协作响应取消。Timeout 在内部 goroutine 恢复 panic。内置 Logger、Cache、Compress、Recovery 可安全放在 Timeout 外层；自定义外层中间件在 `next` 返回后必须先检查 `LastTimeoutErrorResponse()`，有超时响应时停止访问原请求与响应。嵌套 Timeout 由最外层统一设置期限；超时任务最终结束后会关闭遗留响应流、用户值中的 `io.Closer` 并清理 multipart 临时文件。WebSocket 升级、SSE 等长连接接口应使用独立路由/中间件配置，不套普通请求 Timeout。不要在请求返回后保留池化的 `*RequestContext`。
 
-`Cache` 默认最多保存 10000 项、64 MiB 快照数据，每项最多 1 MiB（包括正文、键和头部估算开销）。使用 LRU 淘汰，到期自动回收，无常驻清理 goroutine。自动按 `Vary` 区分响应；额外的请求头维度使用与正文共用预算的索引，索引也计入条目上限。带 Cookie、Authorization、条件头或缓存控制头的请求跳过共享缓存；共享缓存只应安装在公开路由。`StaticWithConfig` 提供对应的静态文件预算；默认 1000 项、64 MiB 总预算、1 MiB 单文件、1 分钟保留期，命中时仍检查文件元数据。静态文件支持 `If-Modified-Since` / 304，HEAD 只返回元数据；设置 `TTL < 0` 可禁用静态文件快照缓存。缓存容量和 TTL 应按业务调整。
+`Cache` 默认最多保存 10000 项、64 MiB 快照数据，每项最多 1 MiB（包括正文、键和头部估算开销）。命中查询使用 32 个分片；淘汰采用二次机会算法（近似 LRU），热点读取无需逐次修改淘汰链。条目与字节预算仍为全局上限，不按分片切割。到期自动回收，无常驻清理 goroutine。自动按 `Vary` 区分响应；额外的请求头维度使用与正文共用预算的索引，索引也计入条目上限。带 Cookie、Authorization、条件头或缓存控制头的请求跳过共享缓存；共享缓存只应安装在公开路由。`StaticWithConfig` 提供对应的静态文件预算；默认 1000 项、64 MiB 总预算、1 MiB 单文件、1 分钟保留期，命中时仍检查文件元数据。静态文件支持 `If-Modified-Since` / 304，HEAD 只返回元数据；设置 `TTL < 0` 可禁用静态文件快照缓存。缓存容量和 TTL 应按业务调整。
+
+同一个未命中请求的并发回源会自动合并。首次还不知道 `Vary` 时，只有完整请求头相同的请求才共同等待；唤醒后每个请求重新按 `Vary` 查缓存，不直接共享另一个请求的上下文或响应。私有响应、错误、超时和已过期结果不会被转发给等待者；等待者的业务取消不会取消正在回源的请求。每条缓存处理链额外最多保留 256 个回源协调项、1 MiB 的键与元数据估算量（同时不超过配置的条目数、字节数）；达到上限直接独立执行，避免等待表无界增长。
+
+缓存与压缩同时使用时，先注册 `Cache` / `CacheWithConfig`，再注册 `Compress`，即 `Cache(Compress(handler))`。反向顺序也保持内容正确，但缓存命中后仍需重新压缩。公开路由示例见 `examples/middleware/main.go`；日志、请求 ID、鉴权和限流等需要逐请求执行的中间件应放在缓存外层。
 
 日志采样可减少日志 I/O：
 
@@ -343,6 +348,8 @@ app.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 
 自定义 `Printf` 同步执行且可能被多个请求并发调用；异步日志输出由调用方管理队列与关闭流程。`Auth` 支持大小写不敏感的 Bearer 前缀，空 token 或空校验函数返回 401，附带 `WWW-Authenticate: Bearer` 与 `Cache-Control: no-store`。
 
+`JSON` 将独立的序列化缓冲移交给响应，避免二次复制，后续仍可追加正文或替换响应流。`GetParam` 按需读取路由用户值，`SetParam` 的本地覆盖优先；参数值仅应在本次请求中使用。
+
 `BindJSON` 默认复制字符串，避免长期保存一个字段却留住整个 JSON 缓冲。确定所有解码字段仅在本次请求中使用时，可以在创建 App 前设置 `config.JSONCopyStrings = false`。`ReduceMemoryUsage` 也可在配置中按吞吐/内存目标选择。
 
 `NewApp` 保存独立的配置副本，`GetConfig` 返回生效配置快照；修改原配置或返回值不会改变运行中的 Server。需要严格拒绝错误配置时使用 `NewAppChecked`；文件与环境变量加载会统一校验，失败时不提交部分环境变量。环境超时单位仍为秒，JSON 配置里的 `time.Duration` 数值单位仍为纳秒。
@@ -350,6 +357,18 @@ app.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 `SaveConfig` 使用同目录临时文件、同步写入和替换，保留已有文件权限；新文件使用 0600。Windows 使用专用替换 API，并处理长路径与替换失败后的只读临时文件清理。
 
 `Run` 等待关闭流程完成后返回；直接使用底层 `Serve` 时，调用方需自行等待 `Shutdown`。自有的 hijack 连接或其他资源可通过 `OnShutdown(func(context.Context) error)` 注册清理，回调应遵守期限且不能递归调用 Shutdown。`ShutdownWithContext` 支持自定义总期限。
+
+## 性能回归验证
+
+`performance_bench_test.go` 覆盖参数按需读取、不同大小的 JSON、缓存并发命中、短响应压缩、中间件顺序，以及 WebSocket 上下文和广播调度。可使用同一台机器、相同工具链对比修改前后：
+
+```sh
+go test ./core ./middleware ./websocket -run '^$' -bench '^BenchmarkPerformance' -benchmem -count=3
+go test ./middleware -run '^$' -bench '^BenchmarkPerformanceCacheHitParallel' -benchmem '-cpu=1,8,16'
+go test -race ./...
+```
+
+这些基准测量对应处理路径的 CPU 与分配开销，广播调度基准不包含网络 I/O；线上吞吐量和延迟还需要使用实际响应大小、缓存命中率、连接数及慢客户端比例做端到端压测。
 
 ## 贡献与交流
 欢迎提交Issue、PR或交流建议！

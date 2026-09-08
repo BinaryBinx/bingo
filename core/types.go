@@ -43,9 +43,7 @@ func NewMiddleware(fn MiddlewareFunc) Middleware {
 // 清空上一请求残留的路径参数，确保新请求拿到干净的实例
 func acquireRequestContext() *RequestContext {
 	reqCtx := requestContextPool.Get().(*RequestContext)
-	if reqCtx.params == nil {
-		reqCtx.params = make(map[string]string)
-	} else if len(reqCtx.params) > 0 {
+	if len(reqCtx.params) > 0 {
 		clear(reqCtx.params)
 	}
 	return reqCtx
@@ -59,7 +57,7 @@ func releaseRequestContext(reqCtx *RequestContext) {
 	reqCtx.app = nil
 	reqCtx.startTime = time.Time{}
 	if len(reqCtx.params) > 128 {
-		reqCtx.params = make(map[string]string, 8)
+		reqCtx.params = nil
 	} else if len(reqCtx.params) > 0 {
 		clear(reqCtx.params)
 	}
@@ -109,13 +107,28 @@ func (c *RequestContext) App() *App {
 	return c.app
 }
 
-// GetParam 获取路径参数
+// GetParam 按需读取路径参数，避免为未使用的参数和中间件用户值创建副本。
+// SetParam 的本地覆盖优先，包括显式设置的空字符串。返回值仅应在请求期间使用。
 func (c *RequestContext) GetParam(key string) string {
-	return c.params[key]
+	if value, ok := c.params[key]; ok {
+		return value
+	}
+	if c.RequestCtx != nil {
+		switch value := c.UserValue(key).(type) {
+		case string:
+			return value
+		case []byte:
+			return string(value)
+		}
+	}
+	return ""
 }
 
 // SetParam 设置路径参数
 func (c *RequestContext) SetParam(key, value string) {
+	if c.params == nil {
+		c.params = make(map[string]string)
+	}
 	c.params[key] = value
 }
 
@@ -130,7 +143,11 @@ func (c *RequestContext) JSON(statusCode int, data interface{}) error {
 		return err
 	}
 
-	c.SetBody(jsonData)
+	// Marshal 返回独立拥有的切片；SwapBody 移交所有权，避免再次复制大响应，
+	// 同时保留后续 AppendBody/BodyWriter 的行为（SetBodyRaw 不支持这一点）。
+	// 先关闭旧流，避免 SwapBody 为返回旧正文而把 SSE/大文件读到 EOF。
+	_ = c.Response.CloseBodyStream()
+	c.Response.SwapBody(jsonData)
 	return nil
 }
 

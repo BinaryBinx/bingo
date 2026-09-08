@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"time"
 
 	"github.com/BinaryBinx/bingo/core"
 	"github.com/BinaryBinx/bingo/middleware"
@@ -22,6 +23,10 @@ func main() {
 	app.Use(middleware.RequestID())
 	// 使用简单限流中间件
 	app.Use(middleware.RateLimit(5)) // 每秒最多5个请求
+	// 本示例只提供公开 GET 接口。先注册缓存，让命中直接复用压缩后的响应；
+	// 请求 ID、限流和日志仍在缓存外层，每个请求都会执行。
+	app.Use(middleware.Cache(time.Minute))
+	app.Use(middleware.Compress())
 
 	// 注册GET路由
 	app.GET("/hello", func(ctx *core.RequestContext) {

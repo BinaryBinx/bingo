@@ -17,47 +17,76 @@ var compressBufPool = sync.Pool{
 	},
 }
 
-func acceptsGzip(value string) bool {
-	values := [][]byte{[]byte(value)}
-	gzipQuality, wildcard := -1.0, -1.0
-	for _, value := range values {
-		for _, coding := range strings.Split(string(value), ",") {
-			parts := strings.Split(coding, ";")
-			name := strings.TrimSpace(parts[0])
-			quality := 1.0
-			for _, parameter := range parts[1:] {
-				key, value, ok := strings.Cut(strings.TrimSpace(parameter), "=")
-				if !ok || !strings.EqualFold(key, "q") {
-					quality = 0
-					continue
-				}
-				parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-				if err != nil || !(parsed >= 0 && parsed <= 1) {
-					quality = 0
-				} else {
-					quality = parsed
-				}
+// gzipPreference scans negotiation tokens without allocating slices. Repeated
+// gzip fields retain the most restrictive quality, including an explicit q=0.
+type gzipPreference struct{ gzip, wildcard float64 }
+
+func (p *gzipPreference) add(value []byte) {
+	for coding := range bytes.SplitSeq(value, []byte(",")) {
+		name, parameters, hasParameters := bytes.Cut(coding, []byte(";"))
+		name = bytes.TrimSpace(name)
+		quality := 1.0
+		for hasParameters {
+			var parameter []byte
+			parameter, parameters, hasParameters = bytes.Cut(parameters, []byte(";"))
+			key, value, ok := bytes.Cut(bytes.TrimSpace(parameter), []byte("="))
+			if !ok || !bytes.EqualFold(key, []byte("q")) {
+				quality = 0
+				continue
 			}
-			if strings.EqualFold(name, "gzip") {
-				if gzipQuality < 0 {
-					gzipQuality = quality
-				} else {
-					gzipQuality = min(gzipQuality, quality)
-				}
+			parsed, err := strconv.ParseFloat(string(bytes.TrimSpace(value)), 64)
+			if err != nil || !(parsed >= 0 && parsed <= 1) {
+				quality = 0
+			} else {
+				quality = parsed
 			}
-			if name == "*" {
-				if wildcard < 0 {
-					wildcard = quality
-				} else {
-					wildcard = min(wildcard, quality)
-				}
+		}
+		if bytes.EqualFold(name, []byte("gzip")) {
+			if p.gzip < 0 {
+				p.gzip = quality
+			} else {
+				p.gzip = min(p.gzip, quality)
+			}
+		}
+		if bytes.Equal(name, []byte("*")) {
+			if p.wildcard < 0 {
+				p.wildcard = quality
+			} else {
+				p.wildcard = min(p.wildcard, quality)
 			}
 		}
 	}
-	if gzipQuality >= 0 {
-		return gzipQuality > 0
+}
+func (p gzipPreference) accepts() bool {
+	if p.gzip >= 0 {
+		return p.gzip > 0
 	}
-	return wildcard > 0
+	return p.wildcard > 0
+}
+func acceptsGzip(value string) bool {
+	p := gzipPreference{-1, -1}
+	p.add([]byte(value))
+	return p.accepts()
+}
+func requestAcceptsGzip(h *fasthttp.RequestHeader) bool {
+	p := gzipPreference{-1, -1}
+	for _, line := range h.PeekAll("Accept-Encoding") {
+		p.add(line)
+	}
+	return p.accepts()
+}
+
+// Checking one directive does not require constructing a map of every value.
+func hasCacheDirective(h *fasthttp.ResponseHeader, wanted string) bool {
+	for _, line := range h.PeekAll("Cache-Control") {
+		for part := range strings.SplitSeq(string(line), ",") {
+			name, _, _ := strings.Cut(part, "=")
+			if strings.EqualFold(strings.TrimSpace(name), wanted) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // addVary 将字段追加到 Vary 头，保留既有的协商维度（如 CORS 的 Origin）
@@ -67,7 +96,7 @@ func addVary(h *fasthttp.ResponseHeader, field string) {
 		h.Set("Vary", field)
 		return
 	}
-	for _, v := range strings.Split(existing, ",") {
+	for v := range strings.SplitSeq(existing, ",") {
 		if strings.TrimSpace(v) == "*" || strings.EqualFold(strings.TrimSpace(v), field) {
 			return
 		}
@@ -86,14 +115,15 @@ func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
 			guard := guardResponse(ctx)
 			head := ctx.IsHead()
-			acceptEncoding := joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))
+			// Capture the original negotiation as a bool: next may mutate request headers.
+			gzipAccepted := !head && requestAcceptsGzip(&ctx.Request.Header)
 			next(ctx)
 			if guard.abandoned(ctx) || ctx.Hijacked() {
 				return
 			}
 			// Every negotiated variant needs Vary, including identity responses.
 			addVary(&ctx.Response.Header, "Accept-Encoding")
-			if head || !acceptsGzip(acceptEncoding) || len(cacheDirectives(ctx.Response.Header.PeekAll("Cache-Control"))["no-transform"]) > 0 {
+			if !gzipAccepted {
 				return
 			}
 
@@ -107,6 +137,10 @@ func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 			statusCode := ctx.Response.StatusCode()
 			if statusCode < 200 || len(body) < 256 || statusCode == fasthttp.StatusPartialContent || statusCode == fasthttp.StatusNoContent || statusCode == fasthttp.StatusNotModified ||
 				len(ctx.Response.Header.Peek("Content-Encoding")) > 0 {
+				return
+			}
+
+			if hasCacheDirective(&ctx.Response.Header, "no-transform") {
 				return
 			}
 

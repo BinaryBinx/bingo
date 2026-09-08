@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BinaryBinx/bingo/internal/requestcontext"
+
 	"github.com/valyala/fasthttp"
 )
 
@@ -54,6 +56,9 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 		if cfg.Duration <= 0 {
 			return next
 		}
+		// Bound additional in-flight coordination independently of snapshot storage.
+		// A full group bypasses coalescing rather than growing without a limit.
+		flights := responseFlights{maxEntries: min(cfg.MaxEntries, 256), maxBytes: min(cfg.MaxBytes, 1<<20)}
 		return func(ctx *fasthttp.RequestCtx) {
 			if !ctx.IsGet() || privateCacheRequest(&ctx.Request.Header) {
 				next(ctx)
@@ -64,31 +69,35 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 				strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
 				string(ctx.Request.Header.Peek("Origin")), ""}
 			started := time.Now()
-			item, ok := cache.get(key, started)
-			if ok && len(item.vary) != 0 {
-				variant := key
-				variant.variant = cacheVariant(item.vary, &ctx.Request.Header)
-				item, ok = cache.get(variant, started)
+			if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok {
+				writeCachedResponse(ctx, item, started)
+				return
 			}
-			if ok {
-				ctx.Response.ResetBody()
-				ctx.SetStatusCode(fasthttp.StatusOK)
-				ctx.SetBody(item.body)
-				// Replace the first occurrence, append subsequent values. Unrelated
-				// outer middleware headers survive without a second deletion pass.
-				for _, h := range item.headers {
-					if h.appendValue {
-						ctx.Response.Header.Add(h.key, h.value)
-					} else {
-						ctx.Response.Header.Set(h.key, h.value)
+			flight, leader := flights.join(key, &ctx.Request.Header)
+			if flight != nil {
+				if leader {
+					// Also releases waiters after a panic or an inner Timeout.
+					defer flights.finish(flight)
+				} else {
+					workContext := requestcontext.From(ctx)
+					select {
+					case <-flight.done:
+					case <-workContext.Done():
+						ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+						return
+					}
+					if workContext.Err() != nil {
+						ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
+						return
 					}
 				}
-				ctx.Response.Header.Set("Age", strconv.FormatInt(int64((item.age+started.Sub(item.stored))/time.Second), 10))
-				if item.requestID && len(ctx.Response.Header.Peek("X-Request-ID")) == 0 {
-					ctx.Response.Header.Set("X-Request-ID", generateRequestID())
+				// Close the lookup/admission race. Do not transfer the leader's
+				// response: Vary may have changed or the response may be private.
+				started = time.Now()
+				if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok {
+					writeCachedResponse(ctx, item, started)
+					return
 				}
-				ctx.Response.Header.Set("X-Cache", "HIT")
-				return
 			}
 			// A handler can change request headers. Select representations from
 			// the original request, including repeated and empty field lines.
@@ -131,7 +140,7 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 			if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
 				return
 			}
-			item = responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
+			item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
 			if len(vary) != 0 {
 				indexCost := int64(len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + 288)
 				for _, field := range vary {
@@ -150,6 +159,35 @@ func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.Req
 			ctx.Response.Header.Set("X-Cache", "MISS")
 		}
 	}
+}
+
+func cachedResponse(cache *boundedCache[responseCacheKey, responseSnapshot], key responseCacheKey, h *fasthttp.RequestHeader, now time.Time) (responseSnapshot, bool) {
+	item, ok := cache.get(key, now)
+	if ok && len(item.vary) != 0 {
+		key.variant = cacheVariant(item.vary, h)
+		return cache.get(key, now)
+	}
+	return item, ok
+}
+
+func writeCachedResponse(ctx *fasthttp.RequestCtx, item responseSnapshot, now time.Time) {
+	ctx.Response.ResetBody()
+	ctx.SetStatusCode(fasthttp.StatusOK)
+	// Cached snapshots are shared: responses must keep their own mutable body copy.
+	ctx.SetBody(item.body)
+	// Replace the first occurrence and append subsequent values, preserving outer headers.
+	for _, h := range item.headers {
+		if h.appendValue {
+			ctx.Response.Header.Add(h.key, h.value)
+		} else {
+			ctx.Response.Header.Set(h.key, h.value)
+		}
+	}
+	ctx.Response.Header.Set("Age", strconv.FormatInt(int64((item.age+now.Sub(item.stored))/time.Second), 10))
+	if item.requestID && len(ctx.Response.Header.Peek("X-Request-ID")) == 0 {
+		ctx.Response.Header.Set("X-Request-ID", generateRequestID())
+	}
+	ctx.Response.Header.Set("X-Cache", "HIT")
 }
 
 func privateCacheRequest(h *fasthttp.RequestHeader) bool {

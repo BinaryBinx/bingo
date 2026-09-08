@@ -15,21 +15,22 @@ import (
 const managerWorkers = 32
 
 type ConnectionManager struct {
-	connections   map[string]*Connection
-	mu            sync.RWMutex
-	timeout       int
-	maxConns      int
-	closed        atomic.Bool
-	ctx           context.Context
-	cancel        context.CancelFunc
-	pending       map[*upgradeReservation]struct{}
-	upgrades      sync.WaitGroup
-	cleanup       sync.WaitGroup
-	cleanupStop   context.CancelFunc
-	broadcasts    sync.WaitGroup
-	broadcastGate chan struct{}
-	shutdownDone  chan struct{}
-	shutdownErr   error
+	connections      map[string]*Connection
+	mu               sync.RWMutex
+	timeout          int
+	maxConns         int
+	closed           atomic.Bool
+	ctx              context.Context
+	cancel           context.CancelFunc
+	pending          map[*upgradeReservation]struct{}
+	upgrades         sync.WaitGroup
+	cleanup          sync.WaitGroup
+	cleanupStop      context.CancelFunc
+	broadcasts       sync.WaitGroup
+	broadcastGate    chan struct{}
+	broadcastWorkers connectionExecutor
+	shutdownDone     chan struct{}
+	shutdownErr      error
 }
 
 // NewConnectionManager allocates no background goroutine. The idle scanner starts
@@ -195,7 +196,7 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return parallelConnections(m.GetAll(), func(conn *Connection) error {
+	return m.broadcastWorkers.run(m.GetAll(), func(conn *Connection) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -204,6 +205,9 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 }
 
 func parallelConnections(conns []*Connection, fn func(*Connection) error) error {
+	if len(conns) == 1 {
+		return fn(conns[0])
+	}
 	var next atomic.Int64
 	var workers sync.WaitGroup
 	var first sync.Once
@@ -294,6 +298,7 @@ func (m *ConnectionManager) shutdown(ctx context.Context) {
 	m.shutdownErr = parallelConnections(m.GetAll(), func(conn *Connection) error { return conn.CloseWithContext(ctx) })
 	m.upgrades.Wait()
 	m.broadcasts.Wait()
+	m.broadcastWorkers.close()
 	m.cleanup.Wait()
 	close(m.shutdownDone)
 }
