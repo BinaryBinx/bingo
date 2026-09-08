@@ -20,8 +20,8 @@ func TestNewApp(t *testing.T) {
 		t.Error("NewApp should return a non-nil App instance")
 	}
 
-	if app.config != config {
-		t.Error("App should use the provided config")
+	if app.config == config || *app.config != *config {
+		t.Error("App should preserve the provided values in an independent config")
 	}
 
 	if app.router == nil {

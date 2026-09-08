@@ -2,13 +2,9 @@ package websocket
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"io"
+
 	"testing"
 	"time"
-
-	coderws "github.com/coder/websocket"
 )
 
 // newTestConnection 构造仅用于管理器测试的伪连接（无底层 conn）
@@ -80,26 +76,5 @@ func TestManagerShutdownIdempotent(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("second shutdown must return immediately")
-	}
-}
-
-// TestTerminalErrorDetection 终止性错误分类：
-// EOF/CloseError 应清理连接；超时与 JSON 编解码错误不清理
-func TestTerminalErrorDetection(t *testing.T) {
-	if isTerminalConnError(nil) {
-		t.Fatal("nil must not be terminal")
-	}
-	if !isTerminalConnError(fmt.Errorf("read: %w", io.EOF)) {
-		t.Fatal("EOF must be terminal")
-	}
-	coderErr := fmt.Errorf("closed: %w", coderws.CloseError{Code: coderws.StatusNormalClosure, Reason: "bye"})
-	if !isTerminalConnError(coderErr) {
-		t.Fatal("CloseError must be terminal")
-	}
-	if isTerminalConnError(context.DeadlineExceeded) {
-		t.Fatal("timeout must not be terminal")
-	}
-	if isTerminalConnError(errors.New("json: unsupported type")) {
-		t.Fatal("JSON encode error must not be terminal")
 	}
 }

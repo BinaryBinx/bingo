@@ -1,9 +1,11 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"time"
 
+	"github.com/BinaryBinx/bingo/internal/requestcontext"
 	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 )
@@ -90,6 +92,10 @@ type RequestContext struct {
 	startTime time.Time
 }
 
+// Context supplies the business deadline installed by Timeout. Pass the returned
+// context to database/HTTP operations instead of retaining the pooled RequestContext.
+func (c *RequestContext) Context() context.Context { return requestcontext.From(c.RequestCtx) }
+
 // SetApp 设置关联的应用实例
 func (c *RequestContext) SetApp(app *App) {
 	c.app = app
@@ -125,9 +131,15 @@ func (c *RequestContext) JSON(statusCode int, data interface{}) error {
 	return nil
 }
 
-// BindJSON 绑定JSON请求体到结构体
+var copyingJSON = sonic.Config{CopyString: true}.Froze()
+
+// BindJSON 默认复制解码字符串，避免业务对象长期保留整个 JSON 请求体。
+// 仅对请求内使用的对象，可在创建 App 前将 JSONCopyStrings 设为 false。
 func (c *RequestContext) BindJSON(v interface{}) error {
-	return sonic.Unmarshal(c.PostBody(), v)
+	if c.app != nil && !c.app.config.JSONCopyStrings {
+		return sonic.Unmarshal(c.PostBody(), v)
+	}
+	return copyingJSON.Unmarshal(c.PostBody(), v)
 }
 
 // String 发送字符串响应

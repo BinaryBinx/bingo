@@ -58,4 +58,16 @@ func TestWebSocketHandshake(t *testing.T) {
 		t.Fatalf("read second message failed: %v", err)
 	}
 	t.Logf("received: %s", data)
+	if err := app.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = conn.ReadMessage(); err == nil {
+		t.Fatal("hijacked connection survived application shutdown")
+	}
+	chatRoom.mu.RLock()
+	users := len(chatRoom.users)
+	chatRoom.mu.RUnlock()
+	if users != 0 {
+		t.Fatalf("shutdown retained %d users", users)
+	}
 }

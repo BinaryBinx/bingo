@@ -34,7 +34,7 @@
 cd examples/websocket
 
 # 编译并运行
-go run main.go
+go run .
 ```
 
 ### 访问应用
@@ -74,27 +74,11 @@ app.GET("/ws", func(ctx *core.RequestContext) {
 
 ### 3. WebSocket处理
 
-示例使用 fasthttp 原生升级路径（`github.com/fasthttp/websocket` 的 `FastHTTPUpgrader`），
-在 hijacked 连接的 goroutine 中运行业务：
+`HandleWebSocket` 在升级前保存实际 TCP 连接，并在 fasthttp 原生升级回调中创建 `chatClient`。fasthttp 的 hijack 包装连接在回调退出前可能忽略 `Close`，因此主动关闭通过保存的底层连接执行，以解除阻塞的读取。
 
-```go
-func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
-	err := cr.upgrader.Upgrade(ctx.RequestCtx, cr.handleConn)
-	if err != nil {
-		log.Printf("WebSocket升级失败: %v", err)
-	}
-}
+每个客户端有一个写入协程。欢迎消息、命令回复和广播全部经过同一发送队列，最多 64 条、256 KiB 待发送正文；队列满或写入超过 5 秒会断开慢客户端。单条入站消息最多 64 KiB，聊天室最多 1000 个连接。
 
-// handleConn 在升级完成的连接上运行消息循环（升级成功后必须显式关闭连接）
-func (cr *ChatRoom) handleConn(conn *websocket.Conn) {
-	defer conn.Close()
-	// ... 接收 / 广播消息
-}
-```
-
-> 注意：Bingo 的 `websocket` 包（`NewWebSocketUpgrader`/`Upgrade`）基于 net/http 风格
-> 接口，适合与标准库 http.Server 配合；在 fasthttp 服务器内请使用本示例的
-> `FastHTTPUpgrader` 路径。
+`NewChatRoom` 向 `App.OnShutdown` 注册清理：拒绝新用户、关闭连接、等待读写协程退出。运行示例请使用 `go run .`，同时编译消息处理和客户端写入模块。
 
 ## 技术特性
 
@@ -155,7 +139,7 @@ func (cr *ChatRoom) handleConn(conn *websocket.Conn) {
 ### 1. 功能测试
 ```bash
 # 启动服务器
-go run main.go
+go run .
 
 # 访问页面
 curl http://localhost:8080
@@ -181,7 +165,7 @@ curl http://localhost:8080/ws
 ### 常见问题
 
 1. **编译错误**
-   - 确保Go版本 >= 1.26.5（与 go.mod 一致）
+   - 确保Go版本 >= 1.26.6；推荐工具链为 Go 1.27.1
    - 检查依赖是否正确安装
    - 确认模块路径正确
 
@@ -235,4 +219,4 @@ MIT License
 
 - [Bingo框架文档](../README.md)
 - [WebSocket规范](https://tools.ietf.org/html/rfc6455)
-- [Go WebSocket指南](https://golang.org/pkg/net/http/#example_FileServer) 
+- [Go WebSocket指南](https://golang.org/pkg/net/http/#example_FileServer)

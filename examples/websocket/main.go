@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,17 +31,19 @@ type ChatRoom struct {
 	app      *core.App
 	upgrader websocket.FastHTTPUpgrader
 	// users 以唯一用户名（连接计数）为键，避免同秒生成相同用户名互相覆盖
-	users   map[string]*websocket.Conn
-	colors  map[string]string // 用户颜色映射
-	mu      sync.RWMutex
-	userSeq atomic.Uint64
+	users       map[string]*chatClient
+	colors      map[string]string // 用户颜色映射
+	mu          sync.RWMutex
+	userSeq     atomic.Uint64
+	closed      bool
+	connections sync.WaitGroup
 }
 
 // NewChatRoom 创建新的聊天室
 func NewChatRoom(app *core.App) *ChatRoom {
-	return &ChatRoom{
+	room := &ChatRoom{
 		app:    app,
-		users:  make(map[string]*websocket.Conn),
+		users:  make(map[string]*chatClient),
 		colors: make(map[string]string),
 		// fasthttp 原生升级器：在回调中交付升级完成的连接，全程可运行
 		upgrader: websocket.FastHTTPUpgrader{
@@ -49,6 +52,10 @@ func NewChatRoom(app *core.App) *ChatRoom {
 			CheckOrigin: func(ctx *fasthttp.RequestCtx) bool { return true },
 		},
 	}
+	if err := app.OnShutdown(room.Shutdown); err != nil {
+		room.closed = true
+	}
+	return room
 }
 
 // 预定义的用户颜色
@@ -97,29 +104,47 @@ func (cr *ChatRoom) getUserColor(username string) string {
 
 // HandleWebSocket 处理WebSocket连接的升级与消息循环
 func (cr *ChatRoom) HandleWebSocket(ctx *core.RequestContext) {
-	err := cr.upgrader.Upgrade(ctx.RequestCtx, cr.handleConn)
+	// fasthttp's hijack wrapper ignores Close until its callback returns. Keep
+	// the actual socket so shutdown can unblock the callback's pending Read.
+	transport := ctx.Conn()
+	err := cr.upgrader.Upgrade(ctx.RequestCtx, func(conn *websocket.Conn) { cr.handleConn(conn, transport) })
 	if err != nil {
 		log.Printf("WebSocket升级失败: %v", err)
 	}
 }
 
 // handleConn 在 hijacked 连接的 goroutine 中运行单个连接的消息循环
-func (cr *ChatRoom) handleConn(conn *websocket.Conn) {
+func (cr *ChatRoom) handleConn(raw *websocket.Conn, transport net.Conn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WebSocket handler panic: %v", r)
+			raw.Close()
+		}
+	}()
 	// 防止超限消息占用内存
-	conn.SetReadLimit(4 * 1024 * 1024)
+	raw.SetReadLimit(64 * 1024)
 
 	// 使用连接计数生成唯一用户名，避免同秒重复
 	username := fmt.Sprintf("用户%d", cr.userSeq.Add(1))
-	userColor := cr.assignUserColor(username)
-
 	cr.mu.Lock()
+	if cr.closed || len(cr.users) >= 1000 {
+		cr.mu.Unlock()
+		raw.Close()
+		return
+	}
+	conn := newChatClient(raw, transport)
+	userColor := userColors[len(cr.colors)%len(userColors)]
+	cr.colors[username] = userColor
+	cr.connections.Add(1)
 	cr.users[username] = conn
 	userCount := len(cr.users)
 	cr.mu.Unlock()
 
 	defer func() {
+		defer cr.connections.Done()
 		// 成功升级后必须显式关闭连接，释放资源
 		conn.Close()
+		<-conn.finished
 
 		// 移除用户并清理其颜色记录
 		cr.mu.Lock()
@@ -255,14 +280,14 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 
 // broadcastMessage 广播消息：锁内只取连接快照，锁外执行网络发送，
 // 避免慢连接持锁阻塞加入/退出；JSON 预编码一次，重复使用只读字节
-func (cr *ChatRoom) broadcastMessage(msg ChatMessage, skip *websocket.Conn) {
+func (cr *ChatRoom) broadcastMessage(msg ChatMessage, skip *chatClient) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
 
 	cr.mu.RLock()
-	conns := make([]*websocket.Conn, 0, len(cr.users))
+	conns := make([]*chatClient, 0, len(cr.users))
 	for _, c := range cr.users {
 		conns = append(conns, c)
 	}
@@ -280,7 +305,7 @@ func (cr *ChatRoom) broadcastMessage(msg ChatMessage, skip *websocket.Conn) {
 }
 
 // removeConn 幂等移除连接并关闭
-func (cr *ChatRoom) removeConn(conn *websocket.Conn) {
+func (cr *ChatRoom) removeConn(conn *chatClient) {
 	cr.mu.Lock()
 	for name, c := range cr.users {
 		if c == conn {

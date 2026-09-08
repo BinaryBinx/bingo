@@ -2,18 +2,11 @@ package core
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log"
-	"net"
-	"os"
-	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/BinaryBinx/bingo/websocket"
@@ -54,9 +47,14 @@ type App struct {
 	// runMode 原子保存运行模式，避免请求处理路径与 Set/GetRunMode 并发读写 data race
 	runMode atomic.Pointer[RunMode]
 	// shutdownCh 在优雅关闭完成时关闭，用于通知 Run 返回
-	shutdownCh chan struct{}
-	// shutdownOnce 保证 shutdownCh 只关闭一次
-	shutdownOnce sync.Once
+	shutdownCh    chan struct{}
+	lifecycleMu   sync.Mutex
+	started       bool
+	shuttingDown  bool
+	serveDone     chan struct{}
+	serveErr      error
+	shutdownErr   error
+	shutdownHooks []func(context.Context) error
 }
 
 // Config 应用配置
@@ -71,6 +69,8 @@ type Config struct {
 	ServerName         string        `json:"server_name"`           // 服务器名称
 	RunMode            RunMode       `json:"run_mode"`              // 运行模式
 	LogLevel           string        `json:"log_level"`             // 日志级别
+	JSONCopyStrings    bool          `json:"json_copy_strings"`     // 避免长期保存解码字段时引用整个请求体
+	ReduceMemoryUsage  bool          `json:"reduce_memory_usage"`
 
 	// 多核性能配置
 	MultiCore MultiCoreConfig `json:"multi_core"`
@@ -105,6 +105,8 @@ func DefaultConfig() *Config {
 		ServerName:         "Bingo",
 		RunMode:            RunModeDebug,
 		LogLevel:           "info",
+		JSONCopyStrings:    true,
+		ReduceMemoryUsage:  true,
 		MultiCore: MultiCoreConfig{
 			Enabled:         true,
 			NumCPU:          0, // 0表示使用所有CPU核心
@@ -121,14 +123,14 @@ func NewApp(config *Config) *App {
 	if config == nil {
 		config = DefaultConfig()
 	}
+	// Keep an immutable effective configuration; callers retain ownership of theirs.
+	copyConfig := *config
+	config = &copyConfig
 
 	normalizeConfig(config)
 
 	// 应用多核性能优化
 	applyMultiCoreOptimization(config)
-
-	// 应用生产环境优化
-	applyProductionOptimization(config)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -144,15 +146,13 @@ func NewApp(config *Config) *App {
 		cancel:      cancel,
 		logger:      logger,
 		shutdownCh:  make(chan struct{}),
+		serveDone:   make(chan struct{}),
 	}
 	mode := config.RunMode
 	app.runMode.Store(&mode)
 
 	handler := app.applyMiddleware(app.router.Handler)
 	app.handler.Store(&handler)
-
-	// 初始化WebSocket升级器
-	app.wsUpgrader = websocket.NewWebSocketUpgrader(nil)
 
 	// 配置fasthttp服务器
 	app.server = &fasthttp.Server{
@@ -168,7 +168,7 @@ func NewApp(config *Config) *App {
 		Name:                         config.ServerName,
 		TCPKeepalive:                 true,
 		TCPKeepalivePeriod:           30 * time.Second, // 定期探测死连接，及时清理失效连接
-		ReduceMemoryUsage:            true,
+		ReduceMemoryUsage:            config.ReduceMemoryUsage,
 		// 多核性能优化配置
 		Concurrency:     config.MultiCore.MaxConns,
 		ReadBufferSize:  config.MultiCore.ReadBufferSize,
@@ -251,7 +251,7 @@ func applyMultiCoreOptimization(config *Config) {
 	}
 
 	// 仅在显式指定正数时覆盖 GOMAXPROCS；NumCPU==0 保留运行时现有调度策略
-	// （Go 1.21+ 会按 Linux cgroup 配额自动调整，显式调用反而会关闭自动更新）
+	// （现代 Go 会考虑 Linux cgroup 配额，显式调用会关闭自动更新）
 	if config.MultiCore.NumCPU > 0 {
 		runtime.GOMAXPROCS(config.MultiCore.NumCPU)
 		logf("🔧 多核优化: 使用 %d 个CPU核心", config.MultiCore.NumCPU)
@@ -261,81 +261,6 @@ func applyMultiCoreOptimization(config *Config) {
 
 	// 注意：fasthttp 内部自带 worker pool，WorkersPerCore 与 CPU 亲和性
 	// 配置项为预留字段，当前版本暂不生效（避免输出误导性日志）
-}
-
-// applyProductionOptimization 应用生产环境优化
-func applyProductionOptimization(config *Config) {
-	logf := func(format string, args ...interface{}) {
-		if config.RunMode == RunModeDebug {
-			log.Printf(format, args...)
-		}
-	}
-
-	if config.RunMode != RunModeRelease {
-		return
-	}
-
-	logf("🏭 生产环境优化已启用")
-
-	// 1. 优化超时设置
-	if config.ReadTimeout == 30*time.Second {
-		config.ReadTimeout = 15 * time.Second
-		logf("🔧 生产优化: 读取超时调整为 15s")
-	}
-	if config.WriteTimeout == 30*time.Second {
-		config.WriteTimeout = 15 * time.Second
-		logf("🔧 生产优化: 写入超时调整为 15s")
-	}
-	if config.IdleTimeout == 60*time.Second {
-		config.IdleTimeout = 30 * time.Second
-		logf("🔧 生产优化: 空闲超时调整为 30s")
-	}
-
-	// 2. 优化缓冲区大小
-	if config.MultiCore.ReadBufferSize == 4096 {
-		config.MultiCore.ReadBufferSize = 8192
-		logf("🔧 生产优化: 读取缓冲区调整为 8KB")
-	}
-	if config.MultiCore.WriteBufferSize == 4096 {
-		config.MultiCore.WriteBufferSize = 8192
-		logf("🔧 生产优化: 写入缓冲区调整为 8KB")
-	}
-
-	// 3. 优化并发连接数
-	if config.MultiCore.MaxConns == 10000 {
-		config.MultiCore.MaxConns = 50000
-		logf("🔧 生产优化: 最大并发连接调整为 50,000")
-	}
-
-	// 4. 优化请求体大小限制
-	if config.MaxRequestBodySize == 4*1024*1024 {
-		config.MaxRequestBodySize = 16 * 1024 * 1024 // 16MB
-		logf("🔧 生产优化: 最大请求体大小调整为 16MB")
-	}
-
-	// 5. 优化工作协程数
-	if config.MultiCore.WorkersPerCore == 4 {
-		config.MultiCore.WorkersPerCore = 8
-		logf("🔧 生产优化: 每核心工作协程数调整为 8")
-	}
-
-	// 6. 设置生产环境服务器名称
-	if config.ServerName == "Bingo" {
-		config.ServerName = "Bingo-Production"
-		logf("🔧 生产优化: 服务器名称调整为 %s", config.ServerName)
-	}
-
-	// 7. 优化日志级别
-	if config.LogLevel == "info" {
-		config.LogLevel = "warn"
-		logf("🔧 生产优化: 日志级别调整为 warn")
-	}
-
-	// 8. 启用TCP Keep-Alive（在 NewApp 中通过 fasthttp.Server.TCPKeepalive 启用）
-	logf("🔧 生产优化: 启用TCP Keep-Alive")
-
-	// 9. 优化内存分配策略
-	logf("🔧 生产优化: 优化内存分配策略")
 }
 
 // handleRequest 处理HTTP请求的主函数
@@ -481,91 +406,6 @@ func (app *App) logRequest(reqCtx *RequestContext) {
 	)
 }
 
-// Run 启动服务器并阻塞，直到收到中断信号或外部调用 Shutdown 完成。
-// 使用 net.Listen 自建监听器（net.JoinHostPort 正确处理 IPv6 地址），
-// 再交给 fasthttp Serve，避免 ListenAndServe 固定使用 tcp4
-func (app *App) Run() error {
-	addr := net.JoinHostPort(app.config.Host, strconv.Itoa(app.config.Port))
-	app.logger.Info("🚀 Bingo服务器启动在 %s", addr)
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		// 启动失败：完整回收与 App 生命周期绑定的后台资源（WebSocket 清理协程等）
-		app.release()
-		return fmt.Errorf("%w: %v", ErrServerStart, err)
-	}
-
-	// 服务器退出（正常关闭或出错）都无条件上报，供 Run 判断退出时机
-	serveErrCh := make(chan error, 1)
-	go func() {
-		serveErrCh <- app.Serve(ln)
-	}()
-
-	// 等待中断信号
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(quit)
-
-	select {
-	case err := <-serveErrCh:
-		// Serve 已退出且未发生显式关闭，说明启动或运行出错
-		app.release()
-		if err == nil || errors.Is(err, fasthttp.ErrAlreadyServing) {
-			return nil
-		}
-		return fmt.Errorf("%w: %v", ErrServerStart, err)
-	case <-quit:
-		log.Println("🛑 正在关闭服务器...")
-		return app.Shutdown()
-	case <-app.shutdownCh:
-		// 外部调用 Shutdown 已完成：等待 Serve 退出后返回
-		<-serveErrCh
-		return nil
-	}
-}
-
-// Shutdown 优雅关闭服务器。
-// 整个退出流程共用统一的 30 秒期限：先以有限并发关闭 WebSocket 连接
-// （到期强制回收），再执行 HTTP 服务器优雅关闭；完成后关闭通知通道，
-// 让外部触发的 Run 正常返回
-func (app *App) Shutdown() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	app.cancel()
-	if app.wsUpgrader != nil {
-		app.wsUpgrader.GetManager().Shutdown(ctx)
-	}
-
-	err := app.server.ShutdownWithContext(ctx)
-
-	app.shutdownOnce.Do(func() {
-		close(app.shutdownCh)
-	})
-	return err
-}
-
-// Serve 在已创建的监听器上提供 HTTP 服务。
-// 这是 Run 内部使用的底层方法，测试或其他需要自行管理监听器的场景也可直接调用。
-// Serve 是阻塞的，直到 listener 被关闭或发生不可恢复的错误。
-func (app *App) Serve(ln net.Listener) error {
-	return app.server.Serve(ln)
-}
-
-// release 回收与 App 生命周期绑定的后台资源（WebSocket 清理协程等）。
-// 用于启动失败等未走完整关闭流程的路径
-func (app *App) release() {
-	app.cancel()
-	if app.wsUpgrader != nil {
-		app.wsUpgrader.GetManager().Shutdown(context.Background())
-	}
-}
-
-// GetWebSocketUpgrader 获取WebSocket升级器
-func (app *App) GetWebSocketUpgrader() *websocket.WebSocketUpgrader {
-	return app.wsUpgrader
-}
-
 // IsDebug 检查是否为调试模式
 func (app *App) IsDebug() bool {
 	return app.currentRunMode() == RunModeDebug
@@ -594,9 +434,11 @@ func (app *App) GetRunMode() RunMode {
 }
 
 // GetConfig 获取应用配置。
-// 返回的指针仅建议在启动前读取或修改；运行期修改请使用 Set/GetRunMode 等专用方法
+// 返回生效配置的独立快照。请在 NewApp 前配置资源限制；运行模式用 SetRunMode 修改。
 func (app *App) GetConfig() *Config {
-	return app.config
+	config := *app.config
+	config.RunMode = app.currentRunMode()
+	return &config
 }
 
 // GetServerName 获取服务器名称

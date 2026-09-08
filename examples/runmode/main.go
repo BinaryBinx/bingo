@@ -12,8 +12,7 @@ func main() {
 	log.Println("🎯 运行模式示例 - 展示不同模式下的行为差异")
 
 	// 创建生产模式配置
-	config := core.DefaultConfig()
-	config.RunMode = core.RunModeRelease
+	config := core.ProductionConfig()
 	config.Host = "0.0.0.0"
 	config.Port = 8080
 
