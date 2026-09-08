@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BinaryBinx/bingo/internal/requestcontext"
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/valyala/fasthttp"
 )
 
@@ -91,6 +92,7 @@ func CORS(allowedOrigins, allowedMethods, allowedHeaders []string) func(fasthttp
 			ctx.Response.Header.Set("Access-Control-Allow-Methods", methods)
 			ctx.Response.Header.Set("Access-Control-Allow-Headers", headers)
 			ctx.Response.Header.Set("Access-Control-Max-Age", "86400")
+			responsemeta.PublishTimeoutHeaders(ctx)
 			if ctx.IsOptions() && origin != "" && len(ctx.Request.Header.Peek("Access-Control-Request-Method")) != 0 {
 				ctx.SetStatusCode(fasthttp.StatusNoContent)
 				return
@@ -120,13 +122,7 @@ func Recovery() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 // Remove stale entity headers after a partial response, preserving security and
 // tracing headers. In particular plain errors must not retain gzip or Location.
 func resetErrorResponse(ctx *fasthttp.RequestCtx, status int, body string) {
-	for _, name := range []string{"Content-Encoding", "Content-Length", "Content-Range", "Transfer-Encoding", "ETag", "Last-Modified", "Location", "Set-Cookie"} {
-		ctx.Response.Header.Del(name)
-	}
-	ctx.SetContentType("text/plain; charset=utf-8")
-	ctx.Response.Header.Set("Cache-Control", "no-store")
-	ctx.SetStatusCode(status)
-	ctx.SetBodyString(body)
+	responsemeta.ResetError(ctx, status, body)
 }
 
 type tokenBucket struct {
@@ -193,6 +189,7 @@ func RequestID() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 		return func(ctx *fasthttp.RequestCtx) {
 			ctx.Response.Header.Set("X-Request-ID", generateRequestID())
+			responsemeta.PublishTimeoutHeaders(ctx)
 			next(ctx)
 		}
 	}
@@ -218,6 +215,7 @@ func Security() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 			ctx.Response.Header.Set("X-XSS-Protection", "1; mode=block")
 			ctx.Response.Header.Set("Content-Security-Policy", "default-src 'self'")
 			ctx.Response.Header.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			responsemeta.PublishTimeoutHeaders(ctx)
 			next(ctx)
 		}
 	}

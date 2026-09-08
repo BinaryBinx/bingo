@@ -19,9 +19,19 @@ type CacheConfig struct {
 	MaxEntries    int
 	MaxBytes      int64
 	MaxEntryBytes int64
+	// CoalesceHeaders selects extra request-header dimensions for in-flight
+	// coordination only. nil keeps the conservative complete-header key; an
+	// explicit empty slice uses Host/URI/Accept-Encoding/Origin only. Waiting
+	// requests still recheck the response's actual Vary before using a snapshot.
+	CoalesceHeaders []string
 }
 
 type responseCacheKey struct{ host, uri, encoding, origin, variant string }
+
+// Includes the intrusive links and a conservative per-entry share of the URL
+// index, in addition to the snapshot, primary map and shard bookkeeping.
+const responseCacheEntryOverhead = 416
+
 type cacheHeader struct {
 	key, value  string
 	appendValue bool
@@ -41,123 +51,167 @@ func Cache(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Reques
 	return CacheWithConfig(CacheConfig{Duration: duration})
 }
 
+// CacheWithConfig creates a shared response cache. Successful unsafe requests
+// automatically invalidate their target URI; use NewCacheHandler for explicit
+// invalidation from application code.
 func CacheWithConfig(cfg CacheConfig) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
-	if cfg.MaxEntries <= 0 {
-		cfg.MaxEntries = 10000
+	return NewCacheHandler(cfg).Middleware
+}
+
+// Middleware shares this cache across the handlers it wraps. Put it inside
+// Timeout so completed writes can invalidate even after the client times out.
+func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+	cfg, cache, flights := c.config, c.cache, &c.flights
+	if cfg.Duration <= 0 {
+		return next
 	}
-	if cfg.MaxBytes <= 0 {
-		cfg.MaxBytes = 64 << 20
-	}
-	if cfg.MaxEntryBytes <= 0 {
-		cfg.MaxEntryBytes = 1 << 20
-	}
-	cache := newBoundedCache[responseCacheKey, responseSnapshot](cfg.MaxEntries, cfg.MaxBytes)
-	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
-		if cfg.Duration <= 0 {
-			return next
+	return func(ctx *fasthttp.RequestCtx) {
+		if c.closed.Load() {
+			next(ctx)
+			return
 		}
-		// Bound additional in-flight coordination independently of snapshot storage.
-		// A full group bypasses coalescing rather than growing without a limit.
-		flights := responseFlights{maxEntries: min(cfg.MaxEntries, 256), maxBytes: min(cfg.MaxBytes, 1<<20)}
-		return func(ctx *fasthttp.RequestCtx) {
-			if !ctx.IsGet() || privateCacheRequest(&ctx.Request.Header) {
+		if !ctx.IsGet() {
+			if unsafeCacheMethod(string(ctx.Method())) {
+				c.handleWrite(ctx, next)
+			} else {
+				next(ctx)
+			}
+			return
+		}
+		if privateCacheRequest(&ctx.Request.Header) || hasResponseSignature(&ctx.Response.Header) {
+			next(ctx)
+			return
+		}
+		guard := guardResponse(ctx)
+		key := responseCacheKey{strings.ToLower(string(ctx.Host())), cacheRequestTarget(ctx),
+			strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
+			string(ctx.Request.Header.Peek("Origin")), ""}
+		stripe := c.invalidationStripe(key.host, key.uri)
+		var generation uint64
+		var started time.Time
+		for {
+			if c.closed.Load() {
 				next(ctx)
 				return
 			}
-			guard := guardResponse(ctx)
-			key := responseCacheKey{string(ctx.Host()), string(ctx.RequestURI()),
-				strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
-				string(ctx.Request.Header.Peek("Origin")), ""}
-			started := time.Now()
-			if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok {
+			generation = stripe.generation.Load()
+			started = time.Now()
+			if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok && generation == stripe.generation.Load() {
 				writeCachedResponse(ctx, item, started)
 				return
 			}
-			flight, leader := flights.join(key, &ctx.Request.Header)
-			if flight != nil {
+			flight, leader := flights.joinGeneration(key, &ctx.Request.Header, generation)
+			if generation != stripe.generation.Load() {
 				if leader {
-					// Also releases waiters after a panic or an inner Timeout.
-					defer flights.finish(flight)
-				} else {
-					workContext := requestcontext.From(ctx)
-					select {
-					case <-flight.done:
-					case <-workContext.Done():
-						ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-						return
-					}
-					if workContext.Err() != nil {
-						ctx.Error("Request timeout", fasthttp.StatusRequestTimeout)
-						return
-					}
+					flights.finish(flight)
 				}
-				// Close the lookup/admission race. Do not transfer the leader's
-				// response: Vary may have changed or the response may be private.
-				started = time.Now()
-				if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok {
-					writeCachedResponse(ctx, item, started)
+				continue
+			}
+			if flight == nil {
+				break
+			}
+			if !leader {
+				workContext := requestcontext.From(ctx)
+				select {
+				case <-flight.done:
+				case <-workContext.Done():
+					resetErrorResponse(ctx, fasthttp.StatusRequestTimeout, "Request timeout")
+					return
+				}
+				if workContext.Err() != nil {
+					resetErrorResponse(ctx, fasthttp.StatusRequestTimeout, "Request timeout")
 					return
 				}
 			}
-			// A handler can change request headers. Select representations from
-			// the original request, including repeated and empty field lines.
-			var requestHeaders fasthttp.RequestHeader
-			ctx.Request.Header.CopyTo(&requestHeaders)
-			next(ctx)
-			if guard.abandoned(ctx) || ctx.Hijacked() {
-				return
-			}
-			if ctx.Response.StatusCode() != fasthttp.StatusOK || ctx.Response.IsBodyStream() {
-				return
-			}
-			now := time.Now()
-			ttl, age := responseFreshness(&ctx.Response.Header, cfg.Duration, started, now)
-			vary, cacheable := cacheVaryFields(&ctx.Response.Header)
-			if ttl <= 0 || !cacheable {
-				cache.delete(key)
-				return
-			}
-			variant := key
-			if len(vary) != 0 {
-				variant.variant = cacheVariant(vary, &requestHeaders)
-			}
-			body := ctx.Response.Body()
-			cost := int64(len(body) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + len(variant.variant) + 288)
-			if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
-				return
-			}
-			var headers []cacheHeader
-			seen := make(map[string]bool)
-			ctx.Response.Header.VisitAll(func(k, v []byte) {
-				name := string(k)
-				if hopByHop(name) || strings.EqualFold(name, "X-Cache") || strings.EqualFold(name, "X-Request-ID") || strings.EqualFold(name, "Age") {
-					return
+			if generation != stripe.generation.Load() {
+				if leader {
+					flights.finish(flight)
 				}
-				headers = append(headers, cacheHeader{name, string(v), seen[name]})
-				seen[name] = true
-				cost += int64(len(k) + len(v) + 48)
-			})
-			if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
+				continue
+			}
+			if leader {
+				// finish is also safe after invalidation removed this flight.
+				defer flights.finish(flight)
+			}
+			// Recheck the actual Vary schema. Uncacheable responses are never
+			// transferred to waiters, which execute their own handler on a miss.
+			started = time.Now()
+			if item, ok := cachedResponse(cache, key, &ctx.Request.Header, started); ok && generation == stripe.generation.Load() {
+				writeCachedResponse(ctx, item, started)
 				return
 			}
-			item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
-			if len(vary) != 0 {
-				indexCost := int64(len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + 288)
-				for _, field := range vary {
-					indexCost += int64(len(field) + 16)
-				}
-				if cfg.MaxEntries < 2 || indexCost > cfg.MaxEntryBytes || cost > cfg.MaxBytes-indexCost {
-					return
-				}
-				// Including the schema in variant keys makes concurrent schema changes safe.
-				// Eviction of either entry is a miss; no auxiliary unbounded index is retained.
-				cache.put(variant, item, cost, now.Add(ttl))
-				cache.put(key, responseSnapshot{vary: vary}, indexCost, now.Add(ttl))
-			} else {
-				cache.put(key, item, cost, now.Add(ttl))
-			}
-			ctx.Response.Header.Set("X-Cache", "MISS")
+			break
 		}
+		// A handler can change request headers. Select representations from
+		// the original request, including repeated and empty field lines.
+		requestHeaders := requestHeaderSnapshots.get()
+		defer requestHeaderSnapshots.put(requestHeaders)
+		requestHeaders.copyFrom(&ctx.Request.Header)
+		next(ctx)
+		if guard.abandoned(ctx) || c.closed.Load() || ctx.Hijacked() {
+			return
+		}
+		if ctx.Response.StatusCode() != fasthttp.StatusOK || ctx.Response.IsBodyStream() {
+			return
+		}
+		now := time.Now()
+		ttl, age := responseFreshness(&ctx.Response.Header, cfg.Duration, started, now)
+		vary, cacheable := cacheVaryFields(&ctx.Response.Header)
+		if ttl <= 0 || !cacheable {
+			stripe.mu.Lock()
+			if generation == stripe.generation.Load() {
+				cache.delete(key)
+			}
+			stripe.mu.Unlock()
+			return
+		}
+		variant := key
+		if len(vary) != 0 {
+			variant.variant = requestHeaders.variant(vary)
+		}
+		body := ctx.Response.Body()
+		cost := int64(len(body) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + len(variant.variant) + responseCacheEntryOverhead)
+		if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
+			return
+		}
+		var headers []cacheHeader
+		seen := make(map[string]bool)
+		ctx.Response.Header.VisitAll(func(k, v []byte) {
+			name := string(k)
+			if hopByHop(name) || strings.EqualFold(name, "X-Cache") || strings.EqualFold(name, "X-Request-ID") || strings.EqualFold(name, "Age") {
+				return
+			}
+			headers = append(headers, cacheHeader{name, string(v), seen[name]})
+			seen[name] = true
+			cost += int64(len(k) + len(v) + 48)
+		})
+		if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
+			return
+		}
+		item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
+		// Serialize only publication and invalidation for this fixed stripe.
+		// An old origin request may finish, but cannot repopulate a new epoch.
+		stripe.mu.Lock()
+		defer stripe.mu.Unlock()
+		if generation != stripe.generation.Load() {
+			return
+		}
+		if len(vary) != 0 {
+			indexCost := int64(len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + responseCacheEntryOverhead)
+			for _, field := range vary {
+				indexCost += int64(len(field) + 16)
+			}
+			if cfg.MaxEntries < 2 || indexCost > cfg.MaxEntryBytes || cost > cfg.MaxBytes-indexCost {
+				return
+			}
+			// Including the schema in variant keys makes concurrent schema changes safe.
+			// Eviction of either entry is a miss; no auxiliary unbounded index is retained.
+			cache.put(variant, item, cost, now.Add(ttl))
+			cache.put(key, responseSnapshot{vary: vary}, indexCost, now.Add(ttl))
+		} else {
+			cache.put(key, item, cost, now.Add(ttl))
+		}
+		ctx.Response.Header.Set("X-Cache", "MISS")
 	}
 }
 
@@ -241,7 +295,7 @@ func cacheDirectives(values [][]byte) map[string][]string {
 }
 
 func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started, now time.Time) (time.Duration, time.Duration) {
-	if hasHeaderValue(h.PeekAll("Set-Cookie")) || hasHeaderValue(h.PeekAll("Connection")) {
+	if hasResponseSignature(h) || hasHeaderValue(h.PeekAll("Set-Cookie")) || hasHeaderValue(h.PeekAll("Connection")) {
 		return 0, 0
 	}
 	d := cacheDirectives(h.PeekAll("Cache-Control"))
@@ -367,16 +421,11 @@ func cacheVaryFields(h *fasthttp.ResponseHeader) ([]string, bool) {
 }
 func cacheVariant(fields []string, h *fasthttp.RequestHeader) string {
 	var key strings.Builder
-	frame := func(value string) {
-		key.WriteString(strconv.Itoa(len(value)))
-		key.WriteByte(':')
-		key.WriteString(value)
-	}
 	for _, field := range fields {
-		frame(field)
+		writeCacheVariantFrame(&key, field)
 		h.VisitAll(func(k, v []byte) {
 			if strings.EqualFold(string(k), field) {
-				frame(string(v))
+				writeCacheVariantFrame(&key, string(v))
 			}
 		})
 		key.WriteByte(';')

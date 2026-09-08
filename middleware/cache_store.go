@@ -10,6 +10,12 @@ import (
 
 const cacheShardCount = 32
 
+// One insertion can rotate at most this many recently referenced candidates.
+// Capacity enforcement may still need multiple evictions for a large value.
+const cacheEvictionScanLimit = 64
+
+type cacheGroupKey struct{ host, uri string }
+
 // boundedCache owns immutable snapshots. Second-chance links select eviction candidates;
 // an expiry heap removes stale entries without scanning the entire map.
 // The one-shot expiry timer stops when empty; no permanent cleanup goroutine is used.
@@ -26,6 +32,10 @@ type boundedCache[K comparable, V any] struct {
 	timer          *time.Timer
 	seed           maphash.Seed
 	shards         [cacheShardCount]cacheShard[K, V]
+	// Optional intrusive index: one head per retained Host/URI, with no entries
+	// for absent URLs. All membership changes share the store's writer lock.
+	groupOf func(K) cacheGroupKey
+	groups  map[cacheGroupKey]*cacheEntry[K, V]
 }
 
 type cacheShard[K comparable, V any] struct {
@@ -34,13 +44,14 @@ type cacheShard[K comparable, V any] struct {
 }
 
 type cacheEntry[K comparable, V any] struct {
-	key          K
-	value        V
-	cost         int64
-	expires      time.Time
-	index        int
-	newer, older *cacheEntry[K, V]
-	referenced   atomic.Bool
+	key                      K
+	value                    V
+	cost                     int64
+	expires                  time.Time
+	index                    int
+	newer, older             *cacheEntry[K, V]
+	referenced               atomic.Bool
+	groupNext, groupPrevious *cacheEntry[K, V]
 }
 
 type entryHeap[K comparable, V any] []*cacheEntry[K, V]
@@ -75,7 +86,28 @@ func (c *boundedCache[K, V]) remove(e *cacheEntry[K, V]) {
 	shard.mu.Lock()
 	delete(shard.items, e.key)
 	shard.mu.Unlock()
+	c.removeMetadata(e)
+}
+
+// The writer lock protects bookkeeping separately from publication. Replacement
+// removes only these links, keeping the old immutable snapshot visible until a
+// new snapshot is ready to replace its shard entry in one operation.
+func (c *boundedCache[K, V]) removeMetadata(e *cacheEntry[K, V]) {
 	c.unlink(e)
+	if c.groupOf != nil {
+		group := c.groupOf(e.key)
+		if e.groupPrevious != nil {
+			e.groupPrevious.groupNext = e.groupNext
+		} else if e.groupNext != nil {
+			c.groups[group] = e.groupNext
+		} else {
+			delete(c.groups, group)
+		}
+		if e.groupNext != nil {
+			e.groupNext.groupPrevious = e.groupPrevious
+		}
+		e.groupNext, e.groupPrevious = nil, nil
+	}
 	delete(c.items, e.key)
 	c.bytes -= e.cost
 	heap.Remove(&c.expiry, e.index)
@@ -107,18 +139,45 @@ func (c *boundedCache[K, V]) delete(key K) {
 	}
 }
 
+// deleteGroup visits only the target's retained variants and Vary schema. Eviction,
+// replacement and expiry remove index membership through the same remove method.
+func (c *boundedCache[K, V]) deleteGroup(group cacheGroupKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.groups[group]
+	if entry == nil {
+		return
+	}
+	for entry != nil {
+		next := entry.groupNext
+		c.remove(entry)
+		entry = next
+	}
+	c.scheduleExpiry()
+}
+
 func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) {
-	if c.maxEntries <= 0 || cost <= 0 || cost > c.maxBytes || !time.Now().Before(expires) {
+	if c.maxEntries <= 0 || cost <= 0 || cost > c.maxBytes {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if old := c.items[key]; old != nil {
-		c.remove(old)
+	// A queued insertion must not replace a valid entry with an already expired
+	// snapshot after waiting for the writer lock.
+	if !time.Now().Before(expires) {
+		return
 	}
+	if old := c.items[key]; old != nil {
+		c.removeMetadata(old)
+	}
+	scanBudget := min(cacheEvictionScanLimit, len(c.items))
 	for len(c.items) >= c.maxEntries || cost > c.maxBytes-c.bytes {
-		// Bound the scan even when concurrent readers continuously touch entries.
-		for scanned := 0; scanned < len(c.items); scanned++ {
+		// Share the scan budget across every eviction in this insertion. Once
+		// exhausted, evict the oldest candidate even if it was referenced. This
+		// trades a little recency precision for bounded second-chance work under
+		// the global writer lock, including when all entries are hot.
+		for scanBudget > 0 {
+			scanBudget--
 			if !c.oldest.referenced.Swap(false) {
 				break
 			}
@@ -130,6 +189,20 @@ func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) 
 	}
 	e := &cacheEntry[K, V]{key: key, value: value, cost: cost, expires: expires}
 	c.items[key] = e
+	if c.groupOf != nil {
+		if c.groups == nil {
+			c.groups = make(map[cacheGroupKey]*cacheEntry[K, V])
+		}
+		group := c.groupOf(key)
+		e.groupNext = c.groups[group]
+		if e.groupNext != nil {
+			e.groupNext.groupPrevious = e
+		}
+		c.groups[group] = e
+	}
+	c.touch(e)
+	c.bytes += cost
+	heap.Push(&c.expiry, e)
 	shard := c.shard(key)
 	shard.mu.Lock()
 	if shard.items == nil {
@@ -137,9 +210,6 @@ func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) 
 	}
 	shard.items[key] = e
 	shard.mu.Unlock()
-	c.touch(e)
-	c.bytes += cost
-	heap.Push(&c.expiry, e)
 	c.scheduleExpiry()
 }
 
@@ -167,6 +237,27 @@ func (c *boundedCache[K, V]) expire() {
 		c.remove(c.expiry[0])
 	}
 	c.scheduleExpiry()
+}
+
+// clear releases all retained snapshots and stops idle expiry scheduling.
+// A callback already queued by time.Timer observes the empty heap under mu.
+func (c *boundedCache[K, V]) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.mu.Lock()
+		shard.items = nil
+		shard.mu.Unlock()
+	}
+	c.items = make(map[K]*cacheEntry[K, V])
+	c.groups = nil
+	c.expiry, c.newest, c.oldest = nil, nil, nil
+	c.bytes = 0
 }
 
 // Links are changed only by writers; hot readers mark a second chance instead.

@@ -3,6 +3,8 @@ package core
 import (
 	"errors"
 	"fmt"
+
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 )
 
 // 定义错误类型
@@ -63,15 +65,20 @@ type ErrorResponse struct {
 	Code    int    `json:"code"`
 }
 
-// SendError 发送错误响应
+// SendError 发送 JSON 错误响应，清理旧正文的编码、校验器和缓存策略，
+// 保留 CORS、安全、请求追踪及认证/重试头。
 func (c *RequestContext) SendError(statusCode int, err error, message string) {
 	// 防御 nil error，避免 err.Error() 直接 panic
 	if err == nil {
 		err = errors.New("unknown error")
 	}
-	c.JSON(statusCode, ErrorResponse{
+	response := ErrorResponse{
 		Error:   err.Error(),
 		Message: message,
 		Code:    statusCode,
-	})
+	}
+	responsemeta.ResetError(c.RequestCtx, statusCode, "")
+	if jsonErr := c.JSON(statusCode, response); jsonErr != nil {
+		resetErrorResponse(c.RequestCtx)
+	}
 }

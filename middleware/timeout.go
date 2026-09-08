@@ -5,9 +5,11 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BinaryBinx/bingo/internal/requestcontext"
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/valyala/fasthttp"
 )
 
@@ -29,6 +31,7 @@ func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Requ
 		protected := Recovery()(next)
 		handler := fasthttp.TimeoutHandler(func(ctx *fasthttp.RequestCtx) {
 			execution := ctx.UserValue(timeoutExecutionKey{}).(*timeoutExecution)
+			execution.started.Store(true)
 			defer execution.finish(ctx)
 			protected(ctx)
 		}, duration, "Request timeout")
@@ -37,12 +40,36 @@ func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Requ
 				next(ctx)
 				return
 			}
+			work, admitted := requestcontext.StartWork(ctx)
+			if !admitted {
+				resetErrorResponse(ctx, fasthttp.StatusServiceUnavailable, "Service Unavailable")
+				ctx.Response.Header.Set("Retry-After", "1")
+				return
+			}
+			if work != nil {
+				// Keep one wrapper reference until timeout/cleanup ownership has
+				// been decided, and another for the potentially detached worker.
+				defer work.Done()
+				work.Retain()
+			}
 			workContext, cancel := context.WithTimeout(requestcontext.From(ctx), duration)
 			requestcontext.SetTimeout(ctx, workContext)
-			execution := &timeoutExecution{}
+			execution := &timeoutExecution{leases: retainConcurrencyLeases(ctx), work: work}
+			responsemeta.TrackTimeoutHeaders(ctx, &execution.headers)
 			ctx.SetUserValue(timeoutExecutionKey{}, execution)
 			defer cancel()
-			handler(ctx)
+			execution.invokeNative(ctx, handler)
+			if !execution.started.Load() && ctx.LastTimeoutErrorResponse() == nil {
+				// fasthttp can reject admission without ever starting a worker.
+				// Restore the error metadata even when used without an App work
+				// tracker or a ConcurrencyLimit lease. No worker can publish now.
+				execution.mu.Lock()
+				execution.finished = true
+				execution.mu.Unlock()
+				execution.releaseWork()
+				execution.headers.Apply(&ctx.Response.Header)
+				ctx.Response.Header.Set("Retry-After", "1")
+			}
 			// fasthttp and context have separate timers. If the deadline is due,
 			// let the context timer publish DeadlineExceeded before cancel would
 			// otherwise publish Canceled. This never waits for business work.
@@ -54,7 +81,8 @@ func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Requ
 			if workContext.Err() == context.DeadlineExceeded && ctx.LastTimeoutErrorResponse() == nil {
 				ctx.TimeoutError("Request timeout")
 			}
-			if ctx.LastTimeoutErrorResponse() != nil {
+			if response := ctx.LastTimeoutErrorResponse(); response != nil {
+				execution.headers.Apply(&response.Header)
 				execution.abandon(ctx)
 			}
 		}
@@ -64,10 +92,36 @@ func Timeout(duration time.Duration) func(fasthttp.RequestHandler) fasthttp.Requ
 type timeoutExecutionKey struct{}
 type timeoutExecution struct {
 	mu                           sync.Mutex
+	started                      atomic.Bool
 	finished, abandoned, cleaned bool
+	leases                       *concurrencyLease
+	work                         *requestcontext.WorkTracker
+	headers                      responsemeta.TimeoutHeaders
+}
+
+func (execution *timeoutExecution) invokeNative(ctx *fasthttp.RequestCtx, handler fasthttp.RequestHandler) {
+	returned := false
+	defer func() {
+		// Native admission can panic while closing a preexisting user stream in
+		// its 429 response, before it ever starts our worker. Release the reserved
+		// references on that exceptional path; keep propagating the original panic.
+		if !returned && !execution.started.Load() {
+			execution.releaseWork()
+		}
+	}()
+	handler(ctx)
+	returned = true
+}
+
+func (execution *timeoutExecution) releaseWork() {
+	releaseConcurrencyLeases(execution.leases)
+	if execution.work != nil {
+		execution.work.Done()
+	}
 }
 
 func (execution *timeoutExecution) finish(ctx *fasthttp.RequestCtx) {
+	defer execution.releaseWork()
 	execution.mu.Lock()
 	execution.finished = true
 	clean := execution.abandoned && !execution.cleaned
@@ -88,7 +142,17 @@ func (execution *timeoutExecution) abandon(ctx *fasthttp.RequestCtx) {
 		// This is the response goroutine. User Close methods may block; cleanup
 		// must not delay sending the timeout snapshot. Usually the still-running
 		// worker performs cleanup itself through finish instead.
-		go cleanupTimedOutRequest(ctx)
+		// The outer request is still admitted. Retain cleanup before it returns,
+		// even if the worker has already dropped its own tracking reference.
+		if execution.work != nil {
+			execution.work.Retain()
+		}
+		go func() {
+			if execution.work != nil {
+				defer execution.work.Done()
+			}
+			cleanupTimedOutRequest(ctx)
+		}()
 	}
 }
 

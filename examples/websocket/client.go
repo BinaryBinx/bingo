@@ -88,7 +88,8 @@ func (c *chatClient) writeLoop() {
 }
 
 // Shutdown rejects late hijack callbacks, closes sockets, then waits for their
-// readers/writers to finish. Registered with App.OnShutdown in NewChatRoom.
+// readers/writers to finish. Registered with App.OnStopping in NewChatRoom so
+// custom hijacked sessions finish before the application's resource cleanup.
 func (cr *ChatRoom) Shutdown(ctx context.Context) error {
 	cr.mu.Lock()
 	cr.closed = true

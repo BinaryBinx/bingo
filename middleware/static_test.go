@@ -51,11 +51,18 @@ func TestStaticRejectsFilesystemEscape(t *testing.T) {
 	} else if err := os.Symlink(outside, link); err != nil {
 		t.Fatal(err)
 	}
-	handler := Static(root)(func(ctx *fasthttp.RequestCtx) { ctx.SetStatusCode(404) })
-	ctx := requestContext(t, "/link/secret.txt", nil)
-	handler(ctx)
-	if ctx.Response.StatusCode() == 200 || string(ctx.Response.Body()) == "secret" {
-		t.Fatal("escaped static root")
+	managed, err := NewStaticHandler(root, StaticConfig{Immutable: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer managed.Close()
+	next := func(ctx *fasthttp.RequestCtx) { ctx.SetStatusCode(404) }
+	for _, handler := range []fasthttp.RequestHandler{Static(root)(next), managed.Middleware(next)} {
+		ctx := requestContext(t, "/link/secret.txt", nil)
+		handler(ctx)
+		if ctx.Response.StatusCode() == 200 || string(ctx.Response.Body()) == "secret" {
+			t.Fatal("escaped static root")
+		}
 	}
 }
 

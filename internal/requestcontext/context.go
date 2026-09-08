@@ -25,8 +25,9 @@ func (c serverContext) Err() error {
 	}
 }
 
-// From provides a cooperative business context. fasthttp.RequestCtx itself only
-// signals server shutdown; timeout middleware attaches a request deadline here.
+// From provides the shared App cancellation parent or the request deadline
+// attached by Timeout. Standalone fasthttp middleware falls back to a safe
+// snapshot of the server's shutdown channel, without retaining RequestCtx.
 func From(ctx *fasthttp.RequestCtx) context.Context {
 	if ctx == nil {
 		return context.Background()

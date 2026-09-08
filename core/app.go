@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BinaryBinx/bingo/internal/requestcontext"
 	"github.com/BinaryBinx/bingo/websocket"
 
 	"github.com/fasthttp/router"
@@ -38,6 +39,7 @@ type App struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	logger      *Logger
+	work        *requestcontext.WorkTracker
 
 	// mu 保护中间件切片的读写
 	mu sync.Mutex
@@ -46,15 +48,17 @@ type App struct {
 	handler atomic.Pointer[fasthttp.RequestHandler]
 	// runMode 原子保存运行模式，避免请求处理路径与 Set/GetRunMode 并发读写 data race
 	runMode atomic.Pointer[RunMode]
-	// shutdownCh 在优雅关闭完成时关闭，用于通知 Run 返回
-	shutdownCh    chan struct{}
-	lifecycleMu   sync.Mutex
-	started       bool
-	shuttingDown  bool
-	serveDone     chan struct{}
-	serveErr      error
-	shutdownErr   error
-	shutdownHooks []func(context.Context) error
+	// shutdownCh 在实际排空和资源清理完成后关闭；调用者也可因期限提前返回错误。
+	shutdownCh      chan struct{}
+	lifecycleMu     sync.Mutex
+	started         bool
+	shuttingDown    bool
+	serveDone       chan struct{}
+	serveErr        error
+	shutdownErr     error
+	shutdownContext context.Context
+	stoppingHooks   []func(context.Context) error
+	shutdownHooks   []func(context.Context) error
 }
 
 // Config 应用配置
@@ -133,6 +137,8 @@ func NewApp(config *Config) *App {
 	applyMultiCoreOptimization(config)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	work := requestcontext.NewWorkTracker()
+	ctx = requestcontext.WithWorkTracker(ctx, work)
 
 	// 初始化日志记录器
 	logLevel := GetLogLevelFromName(config.LogLevel)
@@ -144,6 +150,7 @@ func NewApp(config *Config) *App {
 		middlewares: make([]Middleware, 0),
 		ctx:         ctx,
 		cancel:      cancel,
+		work:        work,
 		logger:      logger,
 		shutdownCh:  make(chan struct{}),
 		serveDone:   make(chan struct{}),
@@ -266,6 +273,16 @@ func applyMultiCoreOptimization(config *Config) {
 // handleRequest 处理HTTP请求的主函数
 // 应用中间件链并路由到相应的处理器
 func (app *App) handleRequest(ctx *fasthttp.RequestCtx) {
+	if app.work.Stopping() {
+		ctx.Error("Service Unavailable", fasthttp.StatusServiceUnavailable)
+		ctx.Response.Header.Set("Cache-Control", "no-store")
+		ctx.Response.Header.Set("Retry-After", "1")
+		ctx.SetConnectionClose()
+		return
+	}
+	// Publish a shared standard parent before any middleware starts a timer.
+	// No background cancellation goroutine ever retains this pooled RequestCtx.
+	requestcontext.Set(ctx, app.ctx)
 	handler := *app.handler.Load()
 	handler(ctx)
 }
@@ -290,37 +307,37 @@ func (app *App) Use(middleware Middleware) {
 
 // GET 注册GET路由
 func (app *App) GET(path string, handler RequestHandler) {
-	app.router.GET(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodGet, path, handler)
 }
 
 // POST 注册POST路由
 func (app *App) POST(path string, handler RequestHandler) {
-	app.router.POST(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodPost, path, handler)
 }
 
 // PUT 注册PUT路由
 func (app *App) PUT(path string, handler RequestHandler) {
-	app.router.PUT(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodPut, path, handler)
 }
 
 // DELETE 注册DELETE路由
 func (app *App) DELETE(path string, handler RequestHandler) {
-	app.router.DELETE(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodDelete, path, handler)
 }
 
 // PATCH 注册PATCH路由
 func (app *App) PATCH(path string, handler RequestHandler) {
-	app.router.PATCH(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodPatch, path, handler)
 }
 
 // HEAD 注册HEAD路由
 func (app *App) HEAD(path string, handler RequestHandler) {
-	app.router.HEAD(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodHead, path, handler)
 }
 
 // OPTIONS 注册OPTIONS路由
 func (app *App) OPTIONS(path string, handler RequestHandler) {
-	app.router.OPTIONS(path, app.wrapHandler(handler))
+	app.mustHandle(fasthttp.MethodOptions, path, handler)
 }
 
 // Group 创建路由组

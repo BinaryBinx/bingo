@@ -26,7 +26,7 @@ type ConnectionManager struct {
 	upgrades         sync.WaitGroup
 	cleanup          sync.WaitGroup
 	cleanupStop      context.CancelFunc
-	broadcasts       sync.WaitGroup
+	deliveries       sync.WaitGroup
 	broadcastGate    chan struct{}
 	broadcastWorkers connectionExecutor
 	shutdownDone     chan struct{}
@@ -151,6 +151,11 @@ func (m *ConnectionManager) BroadcastBinary(data []byte) {
 	_ = m.BroadcastBinaryContext(ctx, data)
 }
 
+// BroadcastContext serializes JSON encoding and delivery with other broadcasts.
+// The context bounds admission and network delivery. JSON marshaling runs in the
+// caller's goroutine: custom MarshalJSON implementations must bound their own
+// work and cannot be interrupted by cancellation. Shutdown does not wait for
+// that application code, and an empty recipient snapshot skips encoding entirely.
 func (m *ConnectionManager) BroadcastContext(ctx context.Context, value interface{}) error {
 	return m.broadcast(ctx, coderws.MessageText, func() ([]byte, error) { return json.Marshal(value) })
 }
@@ -171,9 +176,7 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 		m.mu.Unlock()
 		return ErrManagerClosed
 	}
-	m.broadcasts.Add(1)
 	m.mu.Unlock()
-	defer m.broadcasts.Done()
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(m.ctx, cancel)
 	defer func() { stop(); cancel() }()
@@ -188,7 +191,13 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	conns := m.GetAll()
+	if len(conns) == 0 {
+		return nil
+	}
 	// Encode only after admission: queued batches do not retain encoded copies.
+	// Keep application code outside transport shutdown accounting. Holding the
+	// gate still bounds encoding to one caller and preserves batch ordering.
 	data, err := payload()
 	if err != nil {
 		return err
@@ -196,7 +205,17 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return m.broadcastWorkers.run(m.GetAll(), func(conn *Connection) error {
+	// Shutdown and admission use the same lock: once shutdown starts, a late
+	// encoder cannot start workers or access the manager's closed transports.
+	m.mu.Lock()
+	if m.closed.Load() {
+		m.mu.Unlock()
+		return ErrManagerClosed
+	}
+	m.deliveries.Add(1)
+	m.mu.Unlock()
+	defer m.deliveries.Done()
+	return m.broadcastWorkers.run(conns, func(conn *Connection) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -271,8 +290,9 @@ func (m *ConnectionManager) cleanupConnections(ctx context.Context, timeout time
 }
 
 // ShutdownWithContext permanently stops admission, aborts in-flight handshakes,
-// and waits for connections, broadcasts and idle scanners. At the deadline all
-// owned transports are forcibly closed before returning.
+// and waits for connections, broadcast deliveries and idle scanners. At the
+// deadline all owned transports are forcibly closed before returning. Application
+// JSON encoders are not awaited; they cannot begin delivery after shutdown starts.
 func (m *ConnectionManager) ShutdownWithContext(ctx context.Context) error {
 	m.mu.Lock()
 	if !m.closed.Load() {
@@ -297,7 +317,7 @@ func (m *ConnectionManager) ShutdownWithContext(ctx context.Context) error {
 func (m *ConnectionManager) shutdown(ctx context.Context) {
 	m.shutdownErr = parallelConnections(m.GetAll(), func(conn *Connection) error { return conn.CloseWithContext(ctx) })
 	m.upgrades.Wait()
-	m.broadcasts.Wait()
+	m.deliveries.Wait()
 	m.broadcastWorkers.close()
 	m.cleanup.Wait()
 	close(m.shutdownDone)

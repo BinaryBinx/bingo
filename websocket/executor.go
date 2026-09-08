@@ -33,18 +33,15 @@ type connectionBatch struct {
 func (b *connectionBatch) run() {
 	defer b.done.Done()
 	conns, fn := b.conns, b.fn
-	// Claim small chunks for large fan-outs to avoid one contended atomic per
-	// recipient. Small batches still assign individual peers to separate workers.
-	chunk := max(1, min(8, len(conns)/managerWorkers))
+	// Claim one peer at a time. Reserving a chunk behind a slow socket strands
+	// healthy peers in that chunk even when the other workers are idle.
 	for {
-		start := int(b.next.Add(int64(chunk))) - chunk
-		if start >= len(conns) {
+		index := int(b.next.Add(1) - 1)
+		if index >= len(conns) {
 			return
 		}
-		for _, conn := range conns[start:min(start+chunk, len(conns))] {
-			if err := fn(conn); err != nil {
-				b.first.Do(func() { b.err = err })
-			}
+		if err := fn(conns[index]); err != nil {
+			b.first.Do(func() { b.err = err })
 		}
 	}
 }

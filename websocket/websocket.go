@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	coderws "github.com/coder/websocket"
 )
 
@@ -57,22 +58,27 @@ func (w *WebSocketUpgrader) GetManager() *ConnectionManager { return w.manager }
 // written directly to the socket; do not write another HTTP response on error.
 func (w *WebSocketUpgrader) Upgrade(writer http.ResponseWriter, request *http.Request) (*Connection, error) {
 	if request == nil {
-		http.Error(writer, "invalid WebSocket request", http.StatusBadRequest)
+		writeUpgradeError(writer, "invalid WebSocket request", http.StatusBadRequest)
 		return nil, ErrUpgradeFailed
 	}
 	reservation, err := w.manager.reserve()
 	if err != nil {
-		http.Error(writer, err.Error(), http.StatusServiceUnavailable)
+		writeUpgradeError(writer, err.Error(), http.StatusServiceUnavailable)
 		return nil, err
 	}
 	defer reservation.release()
 	headers := writer.Header().Clone()
 	raw, buffered, err := http.NewResponseController(writer).Hijack()
 	if err != nil {
-		http.Error(writer, "WebSocket requires HTTP hijacking", http.StatusNotImplemented)
+		writeUpgradeError(writer, "WebSocket requires HTTP hijacking", http.StatusNotImplemented)
 		return nil, fmt.Errorf("%w: %v", ErrUpgradeFailed, err)
 	}
 	return w.accept(raw, buffered, headers, request, reservation)
+}
+
+func writeUpgradeError(writer http.ResponseWriter, message string, status int) {
+	responsemeta.ResetHTTPErrorHeaders(writer.Header())
+	http.Error(writer, message, status)
 }
 
 func (w *WebSocketUpgrader) accept(raw net.Conn, buffered *bufio.ReadWriter, headers http.Header, request *http.Request, reservation *upgradeReservation) (*Connection, error) {

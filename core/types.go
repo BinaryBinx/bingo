@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/BinaryBinx/bingo/internal/requestcontext"
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 )
@@ -68,21 +69,7 @@ func releaseRequestContext(reqCtx *RequestContext) {
 // （Content-Encoding/Content-Type/Content-Length 等），避免客户端按旧头解析
 // 错误正文导致解码失败。保留请求追踪（X-Request-ID）与跨域头
 func resetErrorResponse(ctx *fasthttp.RequestCtx) {
-	h := &ctx.Response.Header
-	h.Del("Content-Encoding")
-	h.Del("Content-Type")
-	h.Del("Content-Length")
-	h.Del("Transfer-Encoding")
-	h.Del("Content-Range")
-	h.Del("ETag")
-	h.Del("Last-Modified")
-	h.Del("Location")
-	h.Del("Set-Cookie")
-	h.Set("Cache-Control", "no-store")
-	ctx.Response.ResetBody()
-	ctx.SetContentType("text/plain; charset=utf-8")
-	ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-	ctx.SetBodyString("Internal Server Error")
+	responsemeta.ResetError(ctx, fasthttp.StatusInternalServerError, "Internal Server Error")
 }
 
 // RequestContext 扩展fasthttp.RequestCtx，提供更友好的API
@@ -132,16 +119,16 @@ func (c *RequestContext) SetParam(key, value string) {
 	c.params[key] = value
 }
 
-// JSON 发送JSON响应
+// JSON 发送JSON响应。序列化失败时返回错误，保留原状态、响应头、正文和响应流。
 func (c *RequestContext) JSON(statusCode int, data interface{}) error {
-	c.SetStatusCode(statusCode)
-	c.SetContentType("application/json")
-
-	// 使用sonic进行JSON序列化
+	// 先完成序列化，避免错误时留下新状态/类型与旧正文的混合响应。
 	jsonData, err := sonic.Marshal(data)
 	if err != nil {
 		return err
 	}
+
+	c.SetStatusCode(statusCode)
+	c.SetContentType("application/json")
 
 	// Marshal 返回独立拥有的切片；SwapBody 移交所有权，避免再次复制大响应，
 	// 同时保留后续 AppendBody/BodyWriter 的行为（SetBodyRaw 不支持这一点）。
@@ -195,6 +182,7 @@ func (c *RequestContext) GetHeader(key string) string {
 // SetHeader 设置响应头
 func (c *RequestContext) SetHeader(key, value string) {
 	c.Response.Header.Set(key, value)
+	responsemeta.PublishTimeoutHeader(c.RequestCtx, key)
 }
 
 // GetQuery 获取查询参数
@@ -215,37 +203,37 @@ type RouterGroup struct {
 
 // GET 在路由组中注册GET路由
 func (g *RouterGroup) GET(path string, handler RequestHandler) {
-	g.app.router.GET(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.GET(g.prefix+path, handler)
 }
 
 // POST 在路由组中注册POST路由
 func (g *RouterGroup) POST(path string, handler RequestHandler) {
-	g.app.router.POST(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.POST(g.prefix+path, handler)
 }
 
 // PUT 在路由组中注册PUT路由
 func (g *RouterGroup) PUT(path string, handler RequestHandler) {
-	g.app.router.PUT(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.PUT(g.prefix+path, handler)
 }
 
 // DELETE 在路由组中注册DELETE路由
 func (g *RouterGroup) DELETE(path string, handler RequestHandler) {
-	g.app.router.DELETE(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.DELETE(g.prefix+path, handler)
 }
 
 // PATCH 在路由组中注册PATCH路由
 func (g *RouterGroup) PATCH(path string, handler RequestHandler) {
-	g.app.router.PATCH(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.PATCH(g.prefix+path, handler)
 }
 
 // HEAD 在路由组中注册HEAD路由
 func (g *RouterGroup) HEAD(path string, handler RequestHandler) {
-	g.app.router.HEAD(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.HEAD(g.prefix+path, handler)
 }
 
 // OPTIONS 在路由组中注册OPTIONS路由
 func (g *RouterGroup) OPTIONS(path string, handler RequestHandler) {
-	g.app.router.OPTIONS(g.prefix+path, g.app.wrapHandler(handler))
+	g.app.OPTIONS(g.prefix+path, handler)
 }
 
 // Group 创建子路由组

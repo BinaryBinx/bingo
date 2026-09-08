@@ -1,7 +1,10 @@
 package middleware
 
 import (
+	"crypto/rand"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -33,6 +36,75 @@ func BenchmarkPerformanceCacheHitParallel(b *testing.B) {
 					h(&c)
 				}
 			})
+		})
+	}
+}
+
+func BenchmarkPerformanceStaticSnapshot(b *testing.B) {
+	root := b.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "asset.txt"), []byte(strings.Repeat("x", 16<<10)), 0600); err != nil {
+		b.Fatal(err)
+	}
+	for _, mode := range []string{"legacy", "managed", "immutable"} {
+		b.Run(mode, func(b *testing.B) {
+			next := func(c *fasthttp.RequestCtx) { c.SetStatusCode(404) }
+			var h fasthttp.RequestHandler
+			if mode == "legacy" {
+				h = Static(root)(next)
+			} else {
+				s, err := NewStaticHandler(root, StaticConfig{Immutable: mode == "immutable"})
+				if err != nil {
+					b.Fatal(err)
+				}
+				defer s.Close()
+				h = s.Middleware(next)
+			}
+			var c fasthttp.RequestCtx
+			defer c.Response.Reset()
+			c.Request.SetRequestURI("/asset.txt")
+			h(&c)
+			if c.Response.StatusCode() != 200 || len(c.Response.Body()) != 16<<10 {
+				b.Fatal("snapshot setup failed")
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				c.Response.Reset()
+				h(&c)
+			}
+		})
+	}
+}
+
+func BenchmarkPerformanceCompressionBinary(b *testing.B) {
+	body := make([]byte, 64<<10)
+	if _, err := rand.Read(body); err != nil {
+		b.Fatal(err)
+	}
+	for _, mode := range []string{"baseline", "default", "all-types"} {
+		b.Run(mode, func(b *testing.B) {
+			leaf := func(c *fasthttp.RequestCtx) { c.SetContentType("application/octet-stream"); c.SetBody(body) }
+			h := leaf
+			if mode == "default" {
+				h = Compress()(leaf)
+			}
+			if mode == "all-types" {
+				h = CompressWithConfig(CompressConfig{ContentTypes: []string{"*/*"}})(leaf)
+			}
+			var c fasthttp.RequestCtx
+			defer c.Response.Reset()
+			c.Request.Header.Set("Accept-Encoding", "gzip")
+			// Warm adaptive gzip state as well as pool storage before timing.
+			for i := 0; i < 10000; i++ {
+				c.Response.Reset()
+				h(&c)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				c.Response.Reset()
+				h(&c)
+			}
 		})
 	}
 }

@@ -52,7 +52,7 @@ func NewChatRoom(app *core.App) *ChatRoom {
 			// nil CheckOrigin uses the upgrader's same-origin policy.
 		},
 	}
-	if err := app.OnShutdown(room.Shutdown); err != nil {
+	if err := app.OnStopping(room.Shutdown); err != nil {
 		room.closed = true
 	}
 	return room
@@ -260,15 +260,7 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 		}
 		_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(helpMsg))
 	case "/users":
-		cr.mu.RLock()
-		userList := "在线用户: "
-		for user := range cr.users {
-			userList += user + ", "
-		}
-		cr.mu.RUnlock()
-		if len(userList) > 10 {
-			userList = userList[:len(userList)-2]
-		}
+		userList, userCount := cr.userList()
 		userMsg := ChatMessage{
 			Type:      "system",
 			Username:  "系统",
@@ -289,6 +281,33 @@ func (cr *ChatRoom) handleCommand(username, command string) {
 		}
 		_ = conn.WriteMessage(websocket.TextMessage, mustMarshalJS(timeMsg))
 	}
+}
+
+// userList 只在锁内复制用户名，拼接在锁外完成，避免大聊天室的列表查询
+// 长时间阻塞用户加入和退出。返回的人数与列表来自同一次快照。
+func (cr *ChatRoom) userList() (string, int) {
+	cr.mu.RLock()
+	users := make([]string, 0, len(cr.users))
+	for user := range cr.users {
+		users = append(users, user)
+	}
+	cr.mu.RUnlock()
+
+	const prefix = "在线用户: "
+	size := len(prefix) + max(0, len(users)-1)*len(", ")
+	for _, user := range users {
+		size += len(user)
+	}
+	var list strings.Builder
+	list.Grow(size)
+	list.WriteString(prefix)
+	for index, user := range users {
+		if index > 0 {
+			list.WriteString(", ")
+		}
+		list.WriteString(user)
+	}
+	return list.String(), len(users)
 }
 
 // broadcastMessage 广播消息：锁内只取连接快照，锁外执行网络发送，

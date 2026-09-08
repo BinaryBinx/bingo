@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/valyala/fasthttp"
 )
 
@@ -19,12 +20,12 @@ import (
 // Origin and protocol checks use the same coder/websocket path as Upgrade.
 func (w *WebSocketUpgrader) UpgradeFastHTTP(ctx *fasthttp.RequestCtx, handler func(*Connection)) error {
 	if handler == nil {
-		ctx.Error("WebSocket handler is required", http.StatusInternalServerError)
+		responsemeta.ResetError(ctx, http.StatusInternalServerError, "WebSocket handler is required")
 		return fmt.Errorf("%w: nil handler", ErrUpgradeFailed)
 	}
 	request, err := copyFastHTTPRequest(ctx)
 	if err != nil {
-		ctx.Error("invalid WebSocket request", http.StatusBadRequest)
+		responsemeta.ResetError(ctx, http.StatusBadRequest, "invalid WebSocket request")
 		return fmt.Errorf("%w: %v", ErrUpgradeFailed, err)
 	}
 	headers := make(http.Header)
@@ -111,6 +112,10 @@ func (w *socketResponseWriter) WriteHeader(status int) {
 	if status == http.StatusSwitchingProtocols {
 		w.headers.Del("Content-Encoding")
 	} else {
+		// coder/websocket writes rejection bodies directly after hijacking.
+		// No outer compression or error middleware can repair their headers.
+		responsemeta.ResetHTTPErrorHeaders(w.headers)
+		w.headers.Set("Content-Type", "text/plain; charset=utf-8")
 		w.headers.Set("Connection", "close")
 	}
 	_, w.err = fmt.Fprintf(w.buffered, "HTTP/1.1 %d %s\r\n", status, http.StatusText(status))

@@ -75,7 +75,16 @@ func (app *App) Run() error {
 	}
 	// Serve returning after its listener closes is not a drain-completion event.
 	shutdownErr := app.Shutdown()
-	<-app.shutdownCh
+	if shutdownErr != nil {
+		// A deadline must also bound Run. The coordinator can finish safe cleanup
+		// later if the caller keeps the process alive; never report a clean exit.
+		select {
+		case <-app.serveDone:
+			return errors.Join(app.serveErr, shutdownErr)
+		default:
+			return shutdownErr
+		}
+	}
 	<-app.serveDone
 	return errors.Join(app.serveErr, shutdownErr)
 }
@@ -98,32 +107,55 @@ func (app *App) Shutdown() error {
 	return app.ShutdownWithContext(ctx)
 }
 
-// ShutdownWithContext starts shutdown once. Concurrent callers wait on the same
-// completion event, or their own context. The first caller sets the drain budget.
+// ShutdownWithContext seals admission, cancels business contexts and starts one
+// shutdown coordinator. Callers wait for completion or the earlier of their own
+// deadline and the first caller's budget. Timeout workers and their cleanup are
+// included in draining. Exceeding the budget returns an error, never success.
+// If work ignores cancellation, the coordinator defers resource cleanup until
+// it actually exits; it cannot forcibly terminate application Go code.
 func (app *App) ShutdownWithContext(ctx context.Context) error {
 	app.lifecycleMu.Lock()
-	if app.shuttingDown {
-		app.lifecycleMu.Unlock()
-		select {
-		case <-app.shutdownCh:
-			return app.shutdownErr
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if !app.shuttingDown {
+		app.shuttingDown = true
+		app.shutdownContext = ctx
+		stopping := append([]func(context.Context) error(nil), app.stoppingHooks...)
+		cleanup := append([]func(context.Context) error(nil), app.shutdownHooks...)
+		drained := app.work.Stop()
+		app.cancel()
+		go app.shutdown(ctx, app.wsUpgrader, stopping, cleanup, drained)
 	}
-	app.shuttingDown = true
-	upgrader := app.wsUpgrader
-	hooks := append([]func(context.Context) error(nil), app.shutdownHooks...)
+	budget := app.shutdownContext
 	app.lifecycleMu.Unlock()
-	app.cancel()
-	// Stop accepting HTTP immediately, while upgraded connections also drain.
-	httpDone := make(chan error, 1)
-	go func() { httpDone <- app.server.ShutdownWithContext(ctx) }()
-	var errs []error
-	if upgrader != nil {
-		upgrader.GetManager().Shutdown(ctx)
+	// Prefer an already completed result even if the caller canceled afterwards.
+	select {
+	case <-app.shutdownCh:
+		return app.shutdownErr
+	default:
 	}
-	for _, hook := range hooks {
+	select {
+	case <-app.shutdownCh:
+		return app.shutdownErr
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-budget.Done():
+		return budget.Err()
+	}
+}
+
+func (app *App) shutdown(ctx context.Context, upgrader *websocket.WebSocketUpgrader, stopping, cleanup []func(context.Context) error, drained <-chan struct{}) {
+	// Keep fasthttp's drain alive after a caller's deadline: otherwise its return
+	// no longer tells us whether an active response stream is using resources.
+	// This is one goroutine per App, not a goroutine per request or per hook.
+	httpDone := make(chan error, 1)
+	go func() { httpDone <- app.server.Shutdown() }()
+	wsDone := make(chan error, 1)
+	if upgrader != nil {
+		go func() { wsDone <- upgrader.GetManager().ShutdownWithContext(ctx) }()
+	} else {
+		wsDone <- nil
+	}
+	var errs []error
+	for _, hook := range stopping {
 		if err := callShutdownHook(ctx, hook); err != nil {
 			errs = append(errs, err)
 		}
@@ -131,9 +163,22 @@ func (app *App) ShutdownWithContext(ctx context.Context) error {
 	if err := <-httpDone; err != nil {
 		errs = append(errs, err)
 	}
+	if err := <-wsDone; err != nil {
+		errs = append(errs, err)
+	}
+	<-drained
+	// This phase is safe for database pools and managed static roots, including
+	// when an uncooperative timeout worker finished after the original budget.
+	for _, hook := range cleanup {
+		if err := callShutdownHook(ctx, hook); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		errs = append(errs, err)
+	}
 	app.shutdownErr = errors.Join(errs...)
 	close(app.shutdownCh)
-	return app.shutdownErr
 }
 
 func callShutdownHook(ctx context.Context, hook func(context.Context) error) (err error) {
@@ -145,9 +190,23 @@ func callShutdownHook(ctx context.Context, hook func(context.Context) error) (er
 	return hook(ctx)
 }
 
-// OnShutdown registers cleanup for resources owned by the application, including
-// hijacked sockets. Hooks must honor ctx and must not call Shutdown recursively.
+// OnStopping registers notifications run while HTTP and WebSocket connections
+// drain. Use it to stop producers or close custom hijacked connections; resource
+// destruction needed by active handlers belongs in OnShutdown instead.
+// Hooks run sequentially, must honor ctx and must not recursively call Shutdown.
+func (app *App) OnStopping(hook func(context.Context) error) error {
+	return app.addShutdownHook(hook, true)
+}
+
+// OnShutdown registers resource cleanup after HTTP, WebSocket and tracked
+// business work have drained. On a missed deadline it runs only when late work
+// exits, with the original (possibly expired) context. Hooks must honor ctx and
+// must not recursively call Shutdown. Use OnStopping for pre-drain notifications.
 func (app *App) OnShutdown(hook func(context.Context) error) error {
+	return app.addShutdownHook(hook, false)
+}
+
+func (app *App) addShutdownHook(hook func(context.Context) error, stopping bool) error {
 	app.lifecycleMu.Lock()
 	defer app.lifecycleMu.Unlock()
 	if app.shuttingDown {
@@ -156,7 +215,11 @@ func (app *App) OnShutdown(hook func(context.Context) error) error {
 	if hook == nil {
 		return errors.New("bingo: nil shutdown hook")
 	}
-	app.shutdownHooks = append(app.shutdownHooks, hook)
+	if stopping {
+		app.stoppingHooks = append(app.stoppingHooks, hook)
+	} else {
+		app.shutdownHooks = append(app.shutdownHooks, hook)
+	}
 	return nil
 }
 

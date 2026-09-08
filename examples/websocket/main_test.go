@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +22,18 @@ func TestWebSocketHandshake(t *testing.T) {
 	app.SetRunMode(core.RunModeRelease)
 
 	chatRoom := NewChatRoom(app)
+	// Custom hijacked peers must close during stopping, before the app begins
+	// post-drain resource cleanup. This hook runs after the room's own hook.
+	if err := app.OnStopping(func(context.Context) error {
+		chatRoom.mu.RLock()
+		defer chatRoom.mu.RUnlock()
+		if !chatRoom.closed || len(chatRoom.users) != 0 {
+			return fmt.Errorf("room not drained during stopping: closed=%v, users=%d", chatRoom.closed, len(chatRoom.users))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	app.GET("/ws", func(ctx *core.RequestContext) {
 		chatRoom.HandleWebSocket(ctx)
 	})
@@ -71,6 +86,19 @@ func TestWebSocketHandshake(t *testing.T) {
 	var pong ChatMessage
 	if err := json.Unmarshal(data, &pong); err != nil || pong.Type != "pong" {
 		t.Fatalf("heartbeat response=%s err=%v", data, err)
+	}
+	if err := conn.WriteJSON(ChatMessage{Type: "message", Message: "/users"}); err != nil {
+		t.Fatal(err)
+	}
+	_, data, err = conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var usersMessage ChatMessage
+	if err := json.Unmarshal(data, &usersMessage); err != nil || usersMessage.Type != "system" ||
+		usersMessage.UserCount != 1 || !strings.HasPrefix(usersMessage.Message, "在线用户: 用户") ||
+		strings.HasSuffix(usersMessage.Message, ", ") {
+		t.Fatalf("user list response=%s err=%v", data, err)
 	}
 	// The room now uses the upstream upgrader's same-origin policy.
 	foreign, response, err := websocket.DefaultDialer.Dial("ws://"+ln.Addr().String()+"/ws", http.Header{"Origin": {"https://foreign.test"}})
