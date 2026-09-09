@@ -1,6 +1,6 @@
 module github.com/BinaryBinx/bingo
 
-go 1.26
+go 1.26.0
 
 toolchain go1.27.1
 
@@ -11,10 +11,10 @@ require (
 	github.com/fasthttp/websocket v1.5.12
 	github.com/klauspost/compress v1.20.0
 	github.com/valyala/fasthttp v1.74.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.3 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
 	github.com/bytedance/sonic/loader v0.5.2 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
@@ -23,7 +23,6 @@ require (
 	github.com/savsgio/gotils v0.0.0-20250924091648-bce9a52d7761 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	golang.org/x/arch v0.30.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/arch v0.31.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
 )

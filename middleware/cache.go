@@ -207,12 +207,24 @@ func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.Request
 			// Including the schema in variant keys makes concurrent schema changes safe.
 			// Eviction of either entry is a miss; no auxiliary unbounded index is retained.
 			cache.put(variant, item, cost, now.Add(ttl))
-			cache.put(key, responseSnapshot{vary: vary}, indexCost, now.Add(ttl))
+			putVaryIndex(cache, key, vary, indexCost, now.Add(ttl))
 		} else {
 			cache.put(key, item, cost, now.Add(ttl))
 		}
 		ctx.Response.Header.Set("X-Cache", "MISS")
 	}
+}
+
+func putVaryIndex(cache *boundedCache[responseCacheKey, responseSnapshot], key responseCacheKey, vary []string, cost int64, expires time.Time) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	// A short-lived variant must not hide longer-lived siblings. Keep the old
+	// immutable index when it already covers this expiry; bodies still expire
+	// independently. Changed schemas never inherit an unrelated index's TTL.
+	if old := cache.items[key]; old != nil && slices.Equal(old.value.vary, vary) && !expires.After(old.expires) {
+		return
+	}
+	cache.putLocked(key, responseSnapshot{vary: vary}, cost, expires)
 }
 
 func cachedResponse(cache *boundedCache[responseCacheKey, responseSnapshot], key responseCacheKey, h *fasthttp.RequestHeader, now time.Time) (responseSnapshot, bool) {

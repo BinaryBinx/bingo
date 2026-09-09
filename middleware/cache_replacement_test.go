@@ -16,6 +16,12 @@ func TestCacheReplacementKeepsWarmVaryVariantReadable(t *testing.T) {
 	h := cache.Middleware(func(c *fasthttp.RequestCtx) {
 		calls.Add(1)
 		c.Response.Header.Set("Vary", "X-Variant")
+		c.Response.Header.Set("Cache-Control", "max-age=60")
+		if string(c.Request.Header.Peek("X-Variant")) == "hot" {
+			// Force the cold response to extend and replace the index. Equal or
+			// shorter expiries now reuse the existing immutable index directly.
+			c.Response.Header.Set("Cache-Control", "max-age=30")
+		}
 		c.SetBody(c.Request.Header.Peek("X-Variant"))
 	})
 	request := func(value string) string {

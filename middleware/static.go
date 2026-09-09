@@ -62,9 +62,9 @@ func normalizeStaticConfig(cfg StaticConfig) StaticConfig {
 	if cfg.MaxEntryBytes > cfg.MaxBytes {
 		cfg.MaxEntryBytes = cfg.MaxBytes
 	}
-	if cfg.MaxEntryBytes == 1<<63-1 {
-		// Reserve the sentinel byte used by LimitReader without overflowing.
-		cfg.MaxEntryBytes--
+	if maxBuffer := int64(^uint(0)>>1) - 1; cfg.MaxEntryBytes > maxBuffer {
+		// The snapshot and its sentinel byte must fit a slice on this platform.
+		cfg.MaxEntryBytes = maxBuffer
 	}
 	return cfg
 }
@@ -203,13 +203,27 @@ func serveStatic(ctx *fasthttp.RequestCtx, r *os.Root, cfg StaticConfig, cache *
 // staticBody keeps ownership of f until either closing it or transferring it to
 // fasthttp. A file that grows past the cache limit is rewound and streamed whole.
 func staticBody(ctx *fasthttp.RequestCtx, f *os.File, info os.FileInfo, limit int64) ([]byte, bool, error) {
-	if info.Size() > limit {
+	limit = min(limit, int64(^uint(0)>>1)-1)
+	size := info.Size()
+	if size < 0 || size > limit {
 		ctx.SetStatusCode(fasthttp.StatusOK)
 		ctx.SetBodyStream(f, -1)
 		return nil, true, nil
 	}
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
+	// Stat is a sizing hint, not a promise: one extra byte detects growth without
+	// repeated buffer expansion for the common unchanged-file path. Short reads
+	// are valid when a mutable file shrank since Stat, including empty files.
+	data := make([]byte, int(size)+1)
+	n, err := io.ReadFull(f, data)
+	data = data[:n]
+	if err == nil && int64(n) <= limit {
+		// Only growing files need an additional bounded read. Read at most one
+		// byte past the budget before rewinding and handing ownership to fasthttp.
+		var tail []byte
+		tail, err = io.ReadAll(io.LimitReader(f, limit+1-int64(n)))
+		data = append(data, tail...)
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		f.Close()
 		return nil, false, err
 	}

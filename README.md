@@ -382,7 +382,7 @@ if err := responses.Invalidate("example.test:8080", "/items?id=1"); err != nil {
 
 `responses.Clear()` 清空快照和索引、停止到期定时器，并唤醒等待者；后续请求可以重新填充，清空前的旧回源不能写回。`responses.Close()` 永久关闭缓存并释放这些资源，关闭后的中间件直接执行下游，不再缓存或合并回源。Close 可重复调用；关闭后的 Clear / Invalidate 返回 `middleware.ErrCacheClosed`。这些操作均支持并发调用。显式管理生命周期时使用 `NewCacheHandler` 并注册 OnShutdown；同一个实例跨多个 App 共享时，由共同拥有者负责最终关闭。
 
-替换缓存条目或 Vary 索引时，旧的未过期快照保持可读，直到新快照一次发布完成，避免先删除再插入造成额外回源。新快照在取得写锁后检查有效期，并按容量、到期和 URL 索引规则完成替换。
+替换缓存条目或 Vary 索引时，旧的未过期快照保持可读，直到新快照一次发布完成，避免先删除再插入造成额外回源。新快照在取得写锁后检查有效期，并按容量、到期和 URL 索引规则完成替换。同一 Vary 规则的索引有效期只延长、不因短 TTL 变体写入而缩短；规则改变时使用新规则的有效期。每个变体仍独立检查正文有效期，索引延长不会延长正文缓存时间；索引和正文继续受容量、失效、Clear/Close 约束。
 
 `Compress()` 等价于 `CompressWithConfig(CompressConfig{})`，默认最小 256 字节，只压缩文本、JSON/XML（含 `+json`/`+xml`）、JavaScript、Wasm、表单和 SVG。PNG、ZIP、音视频与 `application/octet-stream` 默认跳过，减少无收益的 gzip 运算。`ContentTypes` 支持忽略大小写和参数的媒体类型匹配，以及单个通配符；nil 使用默认列表，空切片不压缩任何类型，`[]string{"*/*"}` 显式允许所有类型。`Level` 支持 -2、-1、1～9，0 或非法值使用默认级别；`MinSize <= 0` 使用 256。`Disabled: true` 完全旁路；`Skip: func(c *fasthttp.RequestCtx) bool { return string(c.Path()) == "/download" }` 在业务执行前按路由跳过，该回调须支持并发调用。若 Skip 依据其他请求头决定，响应应声明相应 `Vary`。已有编码、流、HEAD、206/204/304 和 `no-transform` 继续受到保护。
 
@@ -409,7 +409,7 @@ app.Use(files.Middleware)
 
 `NewStaticHandler` 在启动时校验根目录，`Reload` 打开失败保留当前目录和缓存。Reload/Close 与请求并发安全，会释放旧快照、到期定时器和根目录句柄，已打开的响应流仍可继续读取；Close 可重复调用，关闭后的静态 GET/HEAD 返回 503。`Immutable: true` 的有效快照命中不访问文件系统，文件变更直到 TTL 到期或 Reload 后可见，仅用于内容不可变的版本化 URL；浏览器缓存策略仍由应用设置。旧 `Static` / `StaticWithConfig` API 保留每请求打开根目录的行为，无需新增关闭流程。完整生命周期示例见 `examples/static/main.go`。
 
-Immutable 大文件使用准确 Content-Length 的文件流，在支持的明文 TCP 连接上可利用 sendfile；开启后必须保证文件在发送期间不被原地修改。普通可变文件及读取中增长的文件仍使用完整流式发送。静态 GET/HEAD 按 `If-Match`、`If-Unmodified-Since`、`If-None-Match`、`If-Modified-Since` 的优先级处理条件，返回对应的 304/412。304/412 及 HEAD 响应不会读取正文。
+Immutable 大文件使用准确 Content-Length 的文件流，在支持的明文 TCP 连接上可利用 sendfile；开启后必须保证文件在发送期间不被原地修改。普通可变大文件及读取中增长到快照预算之外的文件仍使用完整流式发送。预算内文件按 Stat 大小预分配读取缓冲，减少首次读取或快照失效后的扩容与复制；仍检查文件增长、缩短和读取错误，增长超限时回到文件开头转交响应流。静态 GET/HEAD 按 `If-Match`、`If-Unmodified-Since`、`If-None-Match`、`If-Modified-Since` 的优先级处理条件，返回对应的 304/412。304/412 及 HEAD 响应不会读取正文。
 
 默认支持单段 `Range: bytes=起点-终点`、`bytes=起点-` 和 `bytes=-末尾长度`，返回 206、准确的 Content-Range，并只读取选中的字节；合法但越界的请求返回 416 和 `bytes */文件大小`。HEAD 忽略 Range；多段、重复、格式错误或未知单位回退完整响应。`DisableRange: true` 可关闭此能力。If-Range 在前述条件通过后执行，强 ETag 必须精确匹配，日期也必须与 Last-Modified 精确匹配，否则返回完整表示；206 不再进行 gzip 压缩。行为顺序依据 [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.2.2)。
 
@@ -432,11 +432,17 @@ app.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 
 `SendError` 生成 JSON 错误前会关闭旧响应流，清理旧正文的编码、摘要、签名、校验器、Trailer 及缓存策略，保留 CORS、安全、请求 ID 和认证/重试头，并设置 `Cache-Control: no-store`。静态文件读取失败，以及 WebSocket 在升级前或握手阶段拒绝请求时，也采用这套错误响应规则；握手拒绝正文为纯文本。
 
+默认路由 404/405 同样保留已设置的 CORS、安全和请求 ID 头，关闭旧响应流，清理旧实体元数据后返回纯文本错误和 `Cache-Control: no-store`。405 保留路由器计算的 `Allow` 方法列表。
+
+路由组只在注册时统一前缀与子路径之间的斜杠：`Group("/api/").GET("/items", h)`、`Group("/api").GET("items", h)` 均注册 `/api/items`，嵌套 `Group` 与 `Handle` 遵循相同规则。空子路径保留组前缀，`"/"` 子路径保留末尾斜杠；内部斜杠、点段、参数正则和通配符不进行路径清理，原有路由冲突及重定向规则继续适用。
+
 `JSON` 先完成序列化，再更新状态码、类型和正文。序列化失败时返回错误，保留原响应及响应流，不读取或关闭旧流；调用方应处理返回的错误。成功后将独立的序列化缓冲移交给响应，避免二次复制，后续仍可追加正文或替换响应流。`GetParam` 按需读取路由用户值，`SetParam` 的本地覆盖优先；参数值仅应在本次请求中使用。
 
 `BindJSON` 默认复制字符串，避免长期保存一个字段却留住整个 JSON 缓冲。确定所有解码字段仅在本次请求中使用时，可以在创建 App 前设置 `config.JSONCopyStrings = false`。`ReduceMemoryUsage` 也可在配置中按吞吐/内存目标选择。
 
 `NewApp` 保存独立的配置副本，`GetConfig` 返回生效配置快照；修改原配置或返回值不会改变运行中的 Server。需要严格拒绝错误配置时使用 `NewAppChecked`；文件与环境变量加载会统一校验，失败时不提交部分环境变量。环境超时单位仍为秒，JSON 配置里的 `time.Duration` 数值单位仍为纳秒。
+
+`LoadConfigStrict(path)` 额外拒绝顶层及 `multi_core` 的未知字段，并在错误中指出字段名，便于发现配置拼写错误；`LoadConfig(path)` 保留忽略未知字段的兼容行为。两种入口都保留缺失字段的默认值、校验配置值，并拒绝多份 JSON 或尾随垃圾。`multi_core` 使用 `enabled`、`num_cpu`、`workers_per_core`、`enable_cpu_affinity`、`max_conns`、`read_buffer_size`、`write_buffer_size`。文件加载兼容原来的 `NumCPU`、`MaxConns` 等 Go 字段名；新旧名字同时出现时，snake_case 值优先，包括显式的 0 和 false。`SaveConfig` 统一输出 snake_case。WorkersPerCore、EnableCPUAffinity 仍为预留字段。
 
 `SaveConfig` 使用同目录临时文件、同步写入和替换，保留已有文件权限；新文件使用 0600。Windows 使用专用替换 API，并处理长路径与替换失败后的只读临时文件清理。
 
@@ -453,6 +459,7 @@ go test ./core ./middleware ./websocket -run '^$' -bench '^BenchmarkPerformance'
 go test ./internal/requestcontext -run '^$' -bench '^BenchmarkPerformance' -benchmem -count=3
 go test ./examples/websocket -run '^$' -bench '^BenchmarkUserList$' -benchmem -count=3
 go test ./middleware -run '^$' -bench '^BenchmarkStaticFileTCP$' -benchmem -count=3
+go test ./middleware -run '^$' -bench '^BenchmarkStaticBodyRead$' -benchmem -count=3
 go test ./middleware -run '^$' -bench '^BenchmarkPerformanceCacheHitParallel' -benchmem '-cpu=1,8,16'
 go test ./middleware -run '^$' -bench '^BenchmarkCacheEvictionAllHot$' -benchmem -benchtime=200x -count=3
 go test ./middleware -run '^$' -fuzz '^FuzzStaticRangeAndETag$' -fuzztime=30s

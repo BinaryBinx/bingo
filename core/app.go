@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BinaryBinx/bingo/internal/requestcontext"
+	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/BinaryBinx/bingo/websocket"
 
 	"github.com/fasthttp/router"
@@ -83,18 +84,18 @@ type Config struct {
 // MultiCoreConfig 多核性能配置
 type MultiCoreConfig struct {
 	// 是否启用多核优化
-	Enabled bool
+	Enabled bool `json:"enabled"`
 	// 指定使用的CPU核心数（0表示使用所有核心）
-	NumCPU int
+	NumCPU int `json:"num_cpu"`
 	// 每个核心的工作协程数（预留字段，fasthttp 自带 worker pool，当前版本不生效）
-	WorkersPerCore int
+	WorkersPerCore int `json:"workers_per_core"`
 	// 是否启用CPU亲和性（预留字段，当前版本不生效）
-	EnableCPUAffinity bool
+	EnableCPUAffinity bool `json:"enable_cpu_affinity"`
 	// 最大并发连接数
-	MaxConns int
+	MaxConns int `json:"max_conns"`
 	// 连接缓冲区大小
-	ReadBufferSize  int
-	WriteBufferSize int
+	ReadBufferSize  int `json:"read_buffer_size"`
+	WriteBufferSize int `json:"write_buffer_size"`
 }
 
 // DefaultConfig 返回默认配置
@@ -154,6 +155,18 @@ func NewApp(config *Config) *App {
 		logger:      logger,
 		shutdownCh:  make(chan struct{}),
 		serveDone:   make(chan struct{}),
+	}
+	// Router misses replace the representation just like other framework errors.
+	// In particular, keep CORS/tracing headers and the router's 405 Allow header.
+	app.router.NotFound = func(ctx *fasthttp.RequestCtx) {
+		responsemeta.ResetError(ctx, fasthttp.StatusNotFound, fasthttp.StatusMessage(fasthttp.StatusNotFound))
+	}
+	app.router.MethodNotAllowed = func(ctx *fasthttp.RequestCtx) {
+		// An old Trailer declaration can name Allow; restore the freshly computed
+		// method list after removing that declaration and the old trailer values.
+		allow := string(ctx.Response.Header.Peek("Allow"))
+		responsemeta.ResetError(ctx, fasthttp.StatusMethodNotAllowed, fasthttp.StatusMessage(fasthttp.StatusMethodNotAllowed))
+		ctx.Response.Header.Set("Allow", allow)
 	}
 	mode := config.RunMode
 	app.runMode.Store(&mode)
@@ -340,11 +353,11 @@ func (app *App) OPTIONS(path string, handler RequestHandler) {
 	app.mustHandle(fasthttp.MethodOptions, path, handler)
 }
 
-// Group 创建路由组
+// Group 创建路由组。前缀与子路径之间统一使用一个斜杠，前缀可省略开头斜杠。
 func (app *App) Group(prefix string) *RouterGroup {
 	return &RouterGroup{
 		app:    app,
-		prefix: prefix,
+		prefix: joinGroupPath("", prefix),
 	}
 }
 

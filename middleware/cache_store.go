@@ -162,6 +162,16 @@ func (c *boundedCache[K, V]) put(key K, value V, cost int64, expires time.Time) 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.putLocked(key, value, cost, expires)
+}
+
+// putLocked publishes an immutable entry while the caller holds the writer lock.
+// Keeping the same publication path lets schema updates inspect the old expiry
+// atomically without changing the allocation-free reader path.
+func (c *boundedCache[K, V]) putLocked(key K, value V, cost int64, expires time.Time) {
+	if c.maxEntries <= 0 || cost <= 0 || cost > c.maxBytes {
+		return
+	}
 	// A queued insertion must not replace a valid entry with an already expired
 	// snapshot after waiting for the writer lock.
 	if !time.Now().Before(expires) {

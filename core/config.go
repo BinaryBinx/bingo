@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,8 +12,19 @@ import (
 )
 
 // LoadConfig 从 JSON 文件加载配置；文件未提供的字段保留默认值。
+// 为兼容已有文件，忽略未知字段；需要检查拼写错误时使用 LoadConfigStrict。
 // 时间字段沿用 time.Duration 的 JSON 表示，单位为纳秒。
 func LoadConfig(filePath string) (*Config, error) {
+	return loadConfig(filePath, false)
+}
+
+// LoadConfigStrict 与 LoadConfig 使用相同的默认值和旧字段名兼容规则，
+// 但拒绝顶层及 multi_core 中的未知字段。
+func LoadConfigStrict(filePath string) (*Config, error) {
+	return loadConfig(filePath, true)
+}
+
+func loadConfig(filePath string, strict bool) (*Config, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("read configuration %q: %w", filePath, err)
@@ -21,8 +33,27 @@ func LoadConfig(filePath string) (*Config, error) {
 		return nil, fmt.Errorf("%w: configuration must be a JSON object", ErrInvalidConfig)
 	}
 	config := DefaultConfig()
-	if err := json.Unmarshal(data, config); err != nil {
+	// The explicit multi_core field overrides the embedded Config field during
+	// decoding, so strict checking also reaches the compatibility aliases.
+	file := struct {
+		*Config
+		MultiCore *multiCoreFileConfig `json:"multi_core"`
+	}{Config: config}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if strict {
+		decoder.DisallowUnknownFields()
+	}
+	if err := decoder.Decode(&file); err != nil {
 		return nil, fmt.Errorf("%w: decode configuration %q: %w", ErrInvalidConfig, filePath, err)
+	}
+	// Decoder accepts a stream; configuration files must contain exactly one
+	// value, preserving Unmarshal's rejection of trailing objects or garbage.
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("%w: configuration %q has trailing data", ErrInvalidConfig, filePath)
+	}
+	if file.MultiCore != nil {
+		file.MultiCore.apply(&config.MultiCore)
 	}
 	if err := config.Validate(); err != nil {
 		return nil, err

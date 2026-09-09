@@ -195,7 +195,8 @@ func (c *RequestContext) GetForm(key string) string {
 	return string(c.FormValue(key))
 }
 
-// RouterGroup 路由组，用于组织相关路由
+// RouterGroup 路由组，用于组织相关路由。子路径可带或不带开头斜杠；
+// 空子路径保留组前缀，子路径 "/" 表示组前缀的末尾斜杠形式。
 type RouterGroup struct {
 	app    *App
 	prefix string
@@ -203,43 +204,43 @@ type RouterGroup struct {
 
 // GET 在路由组中注册GET路由
 func (g *RouterGroup) GET(path string, handler RequestHandler) {
-	g.app.GET(g.prefix+path, handler)
+	g.app.GET(joinGroupPath(g.prefix, path), handler)
 }
 
 // POST 在路由组中注册POST路由
 func (g *RouterGroup) POST(path string, handler RequestHandler) {
-	g.app.POST(g.prefix+path, handler)
+	g.app.POST(joinGroupPath(g.prefix, path), handler)
 }
 
 // PUT 在路由组中注册PUT路由
 func (g *RouterGroup) PUT(path string, handler RequestHandler) {
-	g.app.PUT(g.prefix+path, handler)
+	g.app.PUT(joinGroupPath(g.prefix, path), handler)
 }
 
 // DELETE 在路由组中注册DELETE路由
 func (g *RouterGroup) DELETE(path string, handler RequestHandler) {
-	g.app.DELETE(g.prefix+path, handler)
+	g.app.DELETE(joinGroupPath(g.prefix, path), handler)
 }
 
 // PATCH 在路由组中注册PATCH路由
 func (g *RouterGroup) PATCH(path string, handler RequestHandler) {
-	g.app.PATCH(g.prefix+path, handler)
+	g.app.PATCH(joinGroupPath(g.prefix, path), handler)
 }
 
 // HEAD 在路由组中注册HEAD路由
 func (g *RouterGroup) HEAD(path string, handler RequestHandler) {
-	g.app.HEAD(g.prefix+path, handler)
+	g.app.HEAD(joinGroupPath(g.prefix, path), handler)
 }
 
 // OPTIONS 在路由组中注册OPTIONS路由
 func (g *RouterGroup) OPTIONS(path string, handler RequestHandler) {
-	g.app.OPTIONS(g.prefix+path, handler)
+	g.app.OPTIONS(joinGroupPath(g.prefix, path), handler)
 }
 
 // Group 创建子路由组
 func (g *RouterGroup) Group(prefix string) *RouterGroup {
 	return &RouterGroup{
 		app:    g.app,
-		prefix: g.prefix + prefix,
+		prefix: joinGroupPath(g.prefix, prefix),
 	}
 }

@@ -1,6 +1,9 @@
 package core
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 // ErrRoutesFrozen means serving or shutdown has begun. Routes are immutable
 // after that boundary, so the request path needs no routing lock.
@@ -27,5 +30,18 @@ func (app *App) mustHandle(method, path string, handler RequestHandler) {
 
 // Handle registers a route in this group with the same startup-only contract.
 func (g *RouterGroup) Handle(method, path string, handler RequestHandler) error {
-	return g.app.Handle(method, g.prefix+path, handler)
+	return g.app.Handle(method, joinGroupPath(g.prefix, path), handler)
+}
+
+// joinGroupPath normalizes only the boundary between a group and its child.
+// Do not use path.Join: cleaning dot segments or inner slashes can change route
+// patterns. An empty child retains the prefix, while "/" requests its slash form.
+func joinGroupPath(prefix, child string) string {
+	if prefix == "" {
+		return "/" + strings.TrimLeft(child, "/")
+	}
+	if child == "" {
+		return prefix
+	}
+	return strings.TrimRight(prefix, "/") + "/" + strings.TrimLeft(child, "/")
 }
