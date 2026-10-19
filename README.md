@@ -353,7 +353,7 @@ Timeout 被 fasthttp 原生并发上限拒绝时返回 429，恢复已发布的�
 
 核心 handler 的 panic 恢复与中间件拒绝/恢复路径共用错误响应重建逻辑：替换正文时清理旧实体头、摘要、签名以及原 Trailer 声明和值，保留公共安全、跨域和追踪头。需要对错误响应签名时，在错误处理外层对最终响应重新计算。
 
-同一个未命中请求的并发回源会自动合并。`CoalesceHeaders: nil` 保留完整请求头分组，适合未知响应维度；每次变化的 `Traceparent`、请求 ID 也会区分回源。公开路由可显式配置稳定维度，例如 `[]string{"Accept-Language"}`；非 nil 空切片 `[]string{}` 只使用 Host、URI、Accept-Encoding、Origin。配置切片在创建时复制，非法字段名退回完整请求头分组。
+同一个未命中请求的并发回源会自动合并。`CoalesceHeaders: nil` 保留完整请求头分组，适合未知响应维度；每次变化的 `Traceparent`、请求 ID 也会区分回源。公开路由可显式配置稳定维度，例如 `[]string{"Accept-Language"}`；非 nil 空切片 `[]string{}` 只使用 Scheme、Host、URI、Accept-Encoding、Origin。所有模式都隔离 HTTP/HTTPS 的缓存快照和并发回源。配置切片在创建时复制，非法字段名退回完整请求头分组。
 
 `CoalesceHeaders` 只控制哪些请求共同等待，不替代响应的 `Vary`。唤醒后每个请求重新按实际 `Vary` 查缓存；不匹配时独立回源，不直接共享另一个请求的上下文或响应。依赖请求头的公开响应仍须正确声明 `Vary`。私有请求绕过合并；私有响应、错误、超时和已过期结果不会被转发给等待者；等待者的业务取消不会取消正在回源的请求。每条缓存处理链额外最多保留 256 个回源协调项、1 MiB 的键与元数据估算量（同时不超过配置的条目数、字节数）；达到上限直接独立执行，避免等待表无界增长。
 
@@ -363,7 +363,9 @@ Timeout 被 fasthttp 原生并发上限拒绝时返回 429，恢复已发布的�
 
 响应已有 `Signature` / `Signature-Input`，或声明对应 Trailer 时，缓存会跳过存储；查缓存前已经设置签名的响应也直接执行下游。字段为空或大小写不规范时仍按签名处理，防止命中时更新 `Age`、请求 ID 等使签名失效。只有正文摘要（如 `Content-Digest`）的响应仍可缓存。需要对缓存命中结果签名时，将签名中间件放在 Cache 外层，并在 `next` 返回后为最终响应重新生成签名。
 
-成功的 PUT/POST/PATCH/DELETE 等不安全请求（包括未知方法，响应为 2xx/3xx）会自动清除目标 URI 的所有 Vary、压缩和 Origin 变体，认证写请求也会生效；安全方法和 4xx/5xx 保留缓存。同源 `Location` / `Content-Location` 目标也会失效。需要在后台任务或其他路由提交数据后主动失效时，保存缓存实例：
+缓存检查响应中的 `Cache-Control`、`Vary`、`Age` 等控制字段时忽略字段名大小写，即使下游关闭 fasthttp 的响应头规范化也生效；不同大小写的重复字段仍一起校验。控制缓存策略的字段出现在 Trailer 中时跳过共享缓存，防止丢失私有性或有效期限制。
+
+成功的 PUT/POST/PATCH/DELETE 等不安全请求（包括未知方法，响应为 2xx/3xx）会自动清除目标 Host、URI 的所有协议、Vary、压缩和 Origin 变体，认证写请求也会生效；安全方法和 4xx/5xx 保留缓存。同源 `Location` / `Content-Location` 目标也会失效。`Invalidate(host, requestURI)` 同样清除 HTTP/HTTPS 等全部协议变体，保持按地址失效的 API 语义。需要在后台任务或其他路由提交数据后主动失效时，保存缓存实例：
 
 ```go
 responses := middleware.NewCacheHandler(middleware.CacheConfig{Duration: time.Minute})

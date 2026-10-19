@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"iter"
 	"net/http"
 	"slices"
 	"strconv"
@@ -21,16 +22,16 @@ type CacheConfig struct {
 	MaxEntryBytes int64
 	// CoalesceHeaders selects extra request-header dimensions for in-flight
 	// coordination only. nil keeps the conservative complete-header key; an
-	// explicit empty slice uses Host/URI/Accept-Encoding/Origin only. Waiting
+	// explicit empty slice uses Scheme/Host/URI/Accept-Encoding/Origin only. Waiting
 	// requests still recheck the response's actual Vary before using a snapshot.
 	CoalesceHeaders []string
 }
 
-type responseCacheKey struct{ host, uri, encoding, origin, variant string }
+type responseCacheKey struct{ scheme, host, uri, encoding, origin, variant string }
 
 // Includes the intrusive links and a conservative per-entry share of the URL
 // index, in addition to the snapshot, primary map and shard bookkeeping.
-const responseCacheEntryOverhead = 416
+const responseCacheEntryOverhead = 448
 
 type cacheHeader struct {
 	key, value  string
@@ -83,9 +84,13 @@ func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.Request
 			return
 		}
 		guard := guardResponse(ctx)
-		key := responseCacheKey{strings.ToLower(string(ctx.Host())), cacheRequestTarget(ctx),
-			strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
-			string(ctx.Request.Header.Peek("Origin")), ""}
+		key := responseCacheKey{
+			scheme:   cacheRequestScheme(ctx),
+			host:     strings.ToLower(string(ctx.Host())),
+			uri:      cacheRequestTarget(ctx),
+			encoding: strings.ToLower(joinHeaderValues(ctx.Request.Header.PeekAll("Accept-Encoding"))),
+			origin:   string(ctx.Request.Header.Peek("Origin")),
+		}
 		stripe := c.invalidationStripe(key.host, key.uri)
 		var generation uint64
 		var started time.Time
@@ -170,14 +175,16 @@ func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.Request
 			variant.variant = requestHeaders.variant(vary)
 		}
 		body := ctx.Response.Body()
-		cost := int64(len(body) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + len(variant.variant) + responseCacheEntryOverhead)
+		cost := int64(len(body) + len(key.scheme) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + len(variant.variant) + responseCacheEntryOverhead)
 		if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
 			return
 		}
 		var headers []cacheHeader
 		seen := make(map[string]bool)
 		ctx.Response.Header.VisitAll(func(k, v []byte) {
-			name := string(k)
+			// Canonical names let hits preserve repeated fields even when the
+			// origin supplied mixed casing with normalization disabled.
+			name := http.CanonicalHeaderKey(string(k))
 			if hopByHop(name) || strings.EqualFold(name, "X-Cache") || strings.EqualFold(name, "X-Request-ID") || strings.EqualFold(name, "Age") {
 				return
 			}
@@ -188,7 +195,7 @@ func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.Request
 		if cost > cfg.MaxEntryBytes || cost > cfg.MaxBytes {
 			return
 		}
-		item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: len(ctx.Response.Header.Peek("X-Request-ID")) > 0}
+		item := responseSnapshot{body: append([]byte(nil), body...), headers: headers, stored: now, age: age, requestID: hasHeaderValue(responseHeaderValues(&ctx.Response.Header, "X-Request-ID"))}
 		// Serialize only publication and invalidation for this fixed stripe.
 		// An old origin request may finish, but cannot repopulate a new epoch.
 		stripe.mu.Lock()
@@ -197,7 +204,7 @@ func (c *CacheHandler) Middleware(next fasthttp.RequestHandler) fasthttp.Request
 			return
 		}
 		if len(vary) != 0 {
-			indexCost := int64(len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + responseCacheEntryOverhead)
+			indexCost := int64(len(key.scheme) + len(key.host) + len(key.uri) + len(key.encoding) + len(key.origin) + responseCacheEntryOverhead)
 			for _, field := range vary {
 				indexCost += int64(len(field) + 16)
 			}
@@ -250,7 +257,7 @@ func writeCachedResponse(ctx *fasthttp.RequestCtx, item responseSnapshot, now ti
 		}
 	}
 	ctx.Response.Header.Set("Age", strconv.FormatInt(int64((item.age+now.Sub(item.stored))/time.Second), 10))
-	if item.requestID && len(ctx.Response.Header.Peek("X-Request-ID")) == 0 {
+	if item.requestID && !hasHeaderValue(responseHeaderValues(&ctx.Response.Header, "X-Request-ID")) {
 		ctx.Response.Header.Set("X-Request-ID", generateRequestID())
 	}
 	ctx.Response.Header.Set("X-Cache", "HIT")
@@ -294,9 +301,9 @@ func joinHeaderValues(values [][]byte) string {
 
 // A directive name is always checked, including directives with quoted field lists.
 // Unknown extensions are ignored; ambiguous freshness values are rejected below.
-func cacheDirectives(values [][]byte) map[string][]string {
+func cacheDirectives(values iter.Seq[[]byte]) map[string][]string {
 	d := make(map[string][]string)
-	for _, line := range values {
+	for line := range values {
 		for _, part := range strings.Split(string(line), ",") {
 			name, value, _ := strings.Cut(strings.TrimSpace(part), "=")
 			name = strings.ToLower(strings.TrimSpace(name))
@@ -307,22 +314,22 @@ func cacheDirectives(values [][]byte) map[string][]string {
 }
 
 func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started, now time.Time) (time.Duration, time.Duration) {
-	if hasResponseSignature(h) || hasHeaderValue(h.PeekAll("Set-Cookie")) || hasHeaderValue(h.PeekAll("Connection")) {
+	if hasResponseSignature(h) || hasCachePolicyTrailer(h) || hasHeaderValue(responseHeaderValues(h, "Set-Cookie")) || hasHeaderValue(responseHeaderValues(h, "Connection")) {
 		return 0, 0
 	}
-	d := cacheDirectives(h.PeekAll("Cache-Control"))
+	d := cacheDirectives(responseHeaderValues(h, "Cache-Control"))
 	for _, name := range []string{"private", "no-store", "no-cache"} {
 		if len(d[name]) > 0 {
 			return 0, 0
 		}
 	}
 	age := time.Duration(0)
-	if values := h.PeekAll("Age"); len(values) > 0 {
-		if len(values) != 1 {
+	if value, count := singleResponseHeader(h, "Age"); count > 0 {
+		if count != 1 {
 			return 0, 0
 		}
 		var ok bool
-		age, ok = secondsDuration(string(values[0]))
+		age, ok = secondsDuration(value)
 		if !ok {
 			return 0, 0
 		}
@@ -333,12 +340,12 @@ func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started,
 	}
 	age += now.Sub(started)
 	date := now
-	if values := h.PeekAll("Date"); len(values) > 0 {
-		if len(values) != 1 {
+	if value, count := singleResponseHeader(h, "Date"); count > 0 {
+		if count != 1 {
 			return 0, 0
 		}
 		var err error
-		date, err = http.ParseTime(string(values[0]))
+		date, err = http.ParseTime(value)
 		if err != nil {
 			return 0, 0
 		}
@@ -360,11 +367,11 @@ func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started,
 		if !ok {
 			return 0, 0
 		}
-	} else if expires := h.PeekAll("Expires"); len(expires) > 0 {
-		if len(expires) != 1 {
+	} else if expires, count := singleResponseHeader(h, "Expires"); count > 0 {
+		if count != 1 {
 			return 0, 0
 		}
-		expiry, err := http.ParseTime(string(expires[0]))
+		expiry, err := http.ParseTime(expires)
 		if err != nil {
 			return 0, 0
 		}
@@ -396,8 +403,8 @@ func hopByHop(name string) bool {
 	return false
 }
 
-func hasHeaderValue(values [][]byte) bool {
-	for _, v := range values {
+func hasHeaderValue(values iter.Seq[[]byte]) bool {
+	for v := range values {
 		if len(v) > 0 {
 			return true
 		}
@@ -409,7 +416,7 @@ func hasHeaderValue(values [][]byte) bool {
 // Other valid Vary fields use a bounded schema index only when requested by the origin.
 func cacheVaryFields(h *fasthttp.ResponseHeader) ([]string, bool) {
 	var fields []string
-	for _, line := range h.PeekAll("Vary") {
+	for line := range responseHeaderValues(h, "Vary") {
 		for _, raw := range strings.Split(string(line), ",") {
 			field := strings.ToLower(strings.TrimSpace(raw))
 			if field == "" {

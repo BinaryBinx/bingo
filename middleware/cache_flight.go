@@ -47,7 +47,7 @@ func (g *responseFlights) joinGeneration(base responseCacheKey, header *fasthttp
 	} else {
 		dimensions = cacheVariant(g.headers, header)
 	}
-	cost := int64(len(dimensions) + len(base.host) + len(base.uri) + len(base.encoding) + len(base.origin) + 256)
+	cost := int64(len(dimensions) + len(base.scheme) + len(base.host) + len(base.uri) + len(base.encoding) + len(base.origin) + 288)
 	if cost > g.maxBytes {
 		return nil, false
 	}

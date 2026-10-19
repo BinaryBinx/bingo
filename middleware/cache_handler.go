@@ -64,6 +64,7 @@ func NewCacheHandler(cfg CacheConfig) *CacheHandler {
 // Call after committing a write that occurs outside this cache's middleware.
 // Existing origin requests may finish for their own clients, but cannot refill
 // invalidated snapshots. Host spelling is case-insensitive; ports remain exact.
+// Every scheme is invalidated, preserving this API's host/URI-wide write fence.
 func (c *CacheHandler) Invalidate(host, requestURI string) error {
 	if !strings.HasPrefix(requestURI, "/") || strings.ContainsAny(requestURI, "#\r\n") {
 		return errors.New("cache invalidation requires an origin-form path and query")
@@ -158,6 +159,19 @@ func unsafeCacheMethod(method string) bool {
 	}
 }
 
+// Retain constants for the usual protocols so cache hits do not allocate an
+// extra scheme string. Unusual absolute-form schemes still remain distinct.
+func cacheRequestScheme(ctx *fasthttp.RequestCtx) string {
+	switch string(ctx.URI().Scheme()) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	default:
+		return strings.ToLower(string(ctx.URI().Scheme()))
+	}
+}
+
 // Strip only the scheme and authority from absolute-form request targets.
 // fasthttp.URI.RequestURI also normalizes/decodes paths, which would merge
 // previously isolated escaped targets. net/url preserves RawPath and RawQuery.
@@ -201,7 +215,7 @@ func (c *CacheHandler) handleWrite(ctx *fasthttp.RequestCtx, next fasthttp.Reque
 		return
 	}
 	for _, header := range []string{"Location", "Content-Location"} {
-		for _, value := range ctx.Response.Header.PeekAll(header) {
+		for value := range responseHeaderValues(&ctx.Response.Header, header) {
 			reference, err := url.Parse(string(value))
 			if err != nil || reference.User != nil {
 				continue

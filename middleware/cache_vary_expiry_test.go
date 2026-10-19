@@ -25,7 +25,7 @@ func TestCacheVaryIndexCoversLongLivedVariants(t *testing.T) {
 				c := requestContext(t, "http://example.test/ttl", map[string]string{"Accept-Language": language})
 				h(c)
 			}
-			key := responseCacheKey{host: "example.test", uri: "/ttl"}
+			key := responseCacheKey{scheme: "http", host: "example.test", uri: "/ttl"}
 			later := time.Now().Add(2 * time.Second)
 			var headers fasthttp.RequestHeader
 			for _, language := range []string{"long", "short"} {
@@ -69,7 +69,7 @@ func TestCacheChangedVarySchemaDoesNotInheritOldExpiry(t *testing.T) {
 	changed = true
 	second := requestContext(t, "http://example.test/schema", map[string]string{"Accept-Language": "fr", "X-Device": "mobile"})
 	h(second)
-	key := responseCacheKey{host: "example.test", uri: "/schema"}
+	key := responseCacheKey{scheme: "http", host: "example.test", uri: "/schema"}
 	item, hit := cachedResponse(cache.cache, key, &second.Request.Header, time.Now())
 	if !hit || string(item.body) != "new schema" {
 		t.Fatalf("schema was not replaced: hit=%t body=%q", hit, item.body)

@@ -138,7 +138,11 @@ func serveStatic(ctx *fasthttp.RequestCtx, r *os.Root, cfg StaticConfig, cache *
 	}
 	contentType := mime.TypeByExtension(filepath.Ext(name))
 	etag := staticETag(cfg, info)
-	if staticMetadata(ctx, info, contentType, etag, cfg.DisableRange) {
+	// HEAD and conditional responses need no file body. For ordinary GETs,
+	// leave the response untouched until Open and its regular-file check succeed;
+	// a vanished/replaced/unreadable file must fall through without file headers.
+	if ctx.IsHead() || staticPreconditionStatus(ctx, info.ModTime(), etag) != 0 {
+		staticMetadata(ctx, info, contentType, etag, cfg.DisableRange)
 		return true
 	}
 	cache.delete(name)
@@ -261,27 +265,9 @@ func staticResponseMetadata(ctx *fasthttp.RequestCtx, modified time.Time, size i
 	} else {
 		ctx.Response.Header.Del("Accept-Ranges")
 	}
-	if values := ctx.Request.Header.PeekAll("If-Match"); len(values) > 0 {
-		if !staticETagListMatches(values, etag, true) {
-			staticPreconditionResponse(ctx, fasthttp.StatusPreconditionFailed)
-			return true
-		}
-	} else if values := ctx.Request.Header.PeekAll("If-Unmodified-Since"); len(values) == 1 {
-		if since, err := http.ParseTime(string(values[0])); err == nil && modified.Truncate(time.Second).After(since) {
-			staticPreconditionResponse(ctx, fasthttp.StatusPreconditionFailed)
-			return true
-		}
-	}
-	if values := ctx.Request.Header.PeekAll("If-None-Match"); len(values) > 0 {
-		if staticETagListMatches(values, etag, false) {
-			staticPreconditionResponse(ctx, fasthttp.StatusNotModified)
-			return true
-		}
-	} else if values := ctx.Request.Header.PeekAll("If-Modified-Since"); len(values) == 1 {
-		if since, err := http.ParseTime(string(values[0])); err == nil && !modified.Truncate(time.Second).After(since) {
-			staticPreconditionResponse(ctx, fasthttp.StatusNotModified)
-			return true
-		}
+	if status := staticPreconditionStatus(ctx, modified, etag); status != 0 {
+		staticPreconditionResponse(ctx, status)
+		return true
 	}
 	if ctx.IsHead() {
 		ctx.Response.ResetBody()
@@ -290,6 +276,30 @@ func staticResponseMetadata(ctx *fasthttp.RequestCtx, modified time.Time, size i
 		return true
 	}
 	return false
+}
+
+// Evaluate without mutating Response so a later failed Open can safely fall
+// through to a dynamic route. Preserve RFC precondition precedence on all paths.
+func staticPreconditionStatus(ctx *fasthttp.RequestCtx, modified time.Time, etag string) int {
+	if values := ctx.Request.Header.PeekAll("If-Match"); len(values) > 0 {
+		if !staticETagListMatches(values, etag, true) {
+			return fasthttp.StatusPreconditionFailed
+		}
+	} else if values := ctx.Request.Header.PeekAll("If-Unmodified-Since"); len(values) == 1 {
+		if since, err := http.ParseTime(string(values[0])); err == nil && modified.Truncate(time.Second).After(since) {
+			return fasthttp.StatusPreconditionFailed
+		}
+	}
+	if values := ctx.Request.Header.PeekAll("If-None-Match"); len(values) > 0 {
+		if staticETagListMatches(values, etag, false) {
+			return fasthttp.StatusNotModified
+		}
+	} else if values := ctx.Request.Header.PeekAll("If-Modified-Since"); len(values) == 1 {
+		if since, err := http.ParseTime(string(values[0])); err == nil && !modified.Truncate(time.Second).After(since) {
+			return fasthttp.StatusNotModified
+		}
+	}
+	return 0
 }
 
 func staticWildcard(values [][]byte) bool {
