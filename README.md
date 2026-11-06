@@ -40,7 +40,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 
 ## 快速开始
 
-最低 Go 版本为 1.26.6；仓库推荐工具链为 Go 1.27.1（启用 `GOTOOLCHAIN=auto` 时自动选择）。
+最低 Go 版本为 1.27.3，与 `go.mod` 保持一致；启用 `GOTOOLCHAIN=auto` 时会自动选择满足要求的工具链。
 
 ### 1. 运行基础REST API示例
 ```bash
