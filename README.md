@@ -332,7 +332,7 @@ app.Use(middleware.CacheWithConfig(middleware.CacheConfig{
 // 缓存命中不消耗回源配额；需要限制所有请求时放在 Cache 前。
 app.Use(middleware.ConcurrencyLimit(256))
 app.Use(middleware.CompressWithConfig(middleware.CompressConfig{
-    Level: 1,     // 1 优先速度；0 使用库的默认压缩级别
+    Level: 1,     // 1 始终优先速度；0 按响应大小和类型选择
     MinSize: 512, // 小于 512 字节不压缩
 }))
 ```
@@ -386,7 +386,7 @@ if err := responses.Invalidate("example.test:8080", "/items?id=1"); err != nil {
 
 替换缓存条目或 Vary 索引时，旧的未过期快照保持可读，直到新快照一次发布完成，避免先删除再插入造成额外回源。新快照在取得写锁后检查有效期，并按容量、到期和 URL 索引规则完成替换。同一 Vary 规则的索引有效期只延长、不因短 TTL 变体写入而缩短；规则改变时使用新规则的有效期。每个变体仍独立检查正文有效期，索引延长不会延长正文缓存时间；索引和正文继续受容量、失效、Clear/Close 约束。
 
-`Compress()` 等价于 `CompressWithConfig(CompressConfig{})`，默认最小 256 字节，只压缩文本、JSON/XML（含 `+json`/`+xml`）、JavaScript、Wasm、表单和 SVG。PNG、ZIP、音视频与 `application/octet-stream` 默认跳过，减少无收益的 gzip 运算。`ContentTypes` 支持忽略大小写和参数的媒体类型匹配，以及单个通配符；nil 使用默认列表，空切片不压缩任何类型，`[]string{"*/*"}` 显式允许所有类型。`Level` 支持 -2、-1、1～9，0 或非法值使用默认级别；`MinSize <= 0` 使用 256。`Disabled: true` 完全旁路；`Skip: func(c *fasthttp.RequestCtx) bool { return string(c.Path()) == "/download" }` 在业务执行前按路由跳过，该回调须支持并发调用。若 Skip 依据其他请求头决定，响应应声明相应 `Vary`。已有编码、流、HEAD、206/204/304 和 `no-transform` 继续受到保护。
+`Compress()` 等价于 `CompressWithConfig(CompressConfig{})`，默认最小 256 字节，只压缩文本、JSON/XML（含 `+json`/`+xml`）、JavaScript、Wasm、表单和 SVG。PNG、ZIP、音视频与 `application/octet-stream` 默认跳过，减少无收益的 gzip 运算。`ContentTypes` 支持忽略大小写和参数的媒体类型匹配，以及单个通配符；nil 使用默认列表，空切片不压缩任何类型，`[]string{"*/*"}` 显式允许所有类型。`Level: 0` 对至少 32 KiB 的 JSON 响应使用级别 1，以略大的压缩输出换取更短的压缩时间，其余响应使用 gzip 默认级别。显式设置 -1 可对所有响应使用 gzip 默认级别，其他有效级别是 -2 和 1～9，非法值仍使用 gzip 默认级别；`MinSize <= 0` 使用 256。`Disabled: true` 完全旁路；`Skip: func(c *fasthttp.RequestCtx) bool { return string(c.Path()) == "/download" }` 在业务执行前按路由跳过，该回调须支持并发调用。若 Skip 依据其他请求头决定，响应应声明相应 `Vary`。已有编码、流、HEAD、206/204/304 和 `no-transform` 继续受到保护。
 
 响应含 `Content-Digest`、`Repr-Digest`、`Digest`、`Content-MD5`、`Signature`、`Signature-Input` 或声明这些字段的 Trailer 时，压缩会在改写头部之前完全跳过，保留正文及完整性元数据。需要对压缩结果生成摘要/签名时，将生成它们的中间件放在 Compress 外层，对最终表示计算。
 
@@ -442,6 +442,8 @@ app.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 
 `BindJSON` 默认复制字符串，避免长期保存一个字段却留住整个 JSON 缓冲。确定所有解码字段仅在本次请求中使用时，可以在创建 App 前设置 `config.JSONCopyStrings = false`。`ReduceMemoryUsage` 也可在配置中按吞吐/内存目标选择。
 
+在默认开启 `ReduceMemoryUsage` 的 App HTTP 路径上，原生 Sonic 生成的 32–256 KiB JSON 正文可使用独立的响应缓冲池。缓冲在发送完成后回收，最多保留 32 个空闲缓冲和 8 MiB 容量。正文在中间件中仍可追加、压缩或替换。
+
 `NewApp` 保存独立的配置副本，`GetConfig` 返回生效配置快照；修改原配置或返回值不会改变运行中的 Server。需要严格拒绝错误配置时使用 `NewAppChecked`；文件与环境变量加载会统一校验，失败时不提交部分环境变量。环境超时单位仍为秒，JSON 配置里的 `time.Duration` 数值单位仍为纳秒。
 
 `LoadConfigStrict(path)` 额外拒绝顶层及 `multi_core` 的未知字段，并在错误中指出字段名，便于发现配置拼写错误；`LoadConfig(path)` 保留忽略未知字段的兼容行为。两种入口都保留缺失字段的默认值、校验配置值，并拒绝多份 JSON 或尾随垃圾。`multi_core` 使用 `enabled`、`num_cpu`、`workers_per_core`、`enable_cpu_affinity`、`max_conns`、`read_buffer_size`、`write_buffer_size`。文件加载兼容原来的 `NumCPU`、`MaxConns` 等 Go 字段名；新旧名字同时出现时，snake_case 值优先，包括显式的 0 和 false。`SaveConfig` 统一输出 snake_case。WorkersPerCore、EnableCPUAffinity 仍为预留字段。
@@ -469,7 +471,15 @@ go test ./websocket -run '^$' -bench '^BenchmarkBroadcastLoopback$' -benchmem -c
 go test -race ./...
 ```
 
-这些基准测量对应处理路径的 CPU 与分配开销，广播调度基准不包含网络 I/O；线上吞吐量和延迟还需要使用实际响应大小、缓存命中率、连接数及慢客户端比例做端到端压测。
+JSON 的三组 HTTP 基准分别测量单独的大响应、用小响应预热 fasthttp 缓冲池后的大响应，以及预热后 95% 小响应和 5% 大响应的混合负载。每组使用一条真实的本地持久连接。分别启动测试进程，避免前一组改变下一组的缓冲池状态。固定每轮请求数可避免大响应组在计时期间重新训练缓冲池。
+
+```bash
+go test ./core -run '^$' -bench '^BenchmarkJSONLargeHTTP$' -benchtime=3000x -benchmem
+go test ./core -run '^$' -bench '^BenchmarkJSONLargeAfterSmallWarmupHTTP$' -benchtime=3000x -benchmem
+go test ./core -run '^$' -bench '^BenchmarkJSONMixedHTTP$' -benchtime=3000x -benchmem
+```
+
+广播调度基准不包含网络 I/O。线上吞吐量和延迟还需要使用实际响应大小、缓存命中率、连接数及慢客户端比例做端到端压测。
 
 ## 贡献与交流
 欢迎提交Issue、PR或交流建议！

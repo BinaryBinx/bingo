@@ -14,6 +14,7 @@ const broadcastWorkerIdle = 30 * time.Second
 type connectionExecutor struct {
 	mu        sync.Mutex
 	jobs      chan *connectionBatch
+	batch     connectionBatch
 	workers   sync.WaitGroup
 	count     int
 	timer     *time.Timer
@@ -74,7 +75,12 @@ func (e *connectionExecutor) run(conns []*Connection, fn func(*Connection) error
 		})
 		e.count++
 	}
-	batch := &connectionBatch{conns: conns, fn: fn}
+	// run holds mu and waits for all workers before returning. This batch
+	// can be overwritten by the next call only after all workers are done.
+	batch := &e.batch
+	batch.conns, batch.fn = conns, fn
+	batch.next.Store(0)
+	batch.first = sync.Once{}
 	batch.done.Add(wanted)
 	for i := 0; i < wanted; i++ {
 		e.jobs <- batch
@@ -88,7 +94,9 @@ func (e *connectionExecutor) run(conns []*Connection, fn func(*Connection) error
 	} else {
 		e.timer.Reset(broadcastWorkerIdle)
 	}
-	return batch.err
+	err := batch.err
+	batch.err = nil
+	return err
 }
 
 func (e *connectionExecutor) expire() {

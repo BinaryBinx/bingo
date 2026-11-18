@@ -163,7 +163,12 @@ func (c *RequestContext) JSON(statusCode int, data interface{}) error {
 	c.SetStatusCode(statusCode)
 	c.SetContentType("application/json")
 	if scratch != nil && cap(body) <= maxJSONBuffer {
-		c.Response.SetBody(body) // copy before returning scratch to the pool
+		if c.app != nil && c.app.config.ReduceMemoryUsage &&
+			len(body) >= minReusableJSONBody && c.Conn() != nil {
+			setReusableJSONBody(c.RequestCtx, body)
+		} else {
+			c.Response.SetBody(body) // copy before returning scratch to the pool
+		}
 	} else {
 		// The response owns detached/oversized bodies. Close the old stream
 		// first so SwapBody cannot read it to EOF.

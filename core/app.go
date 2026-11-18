@@ -298,6 +298,11 @@ func (app *App) handleRequest(ctx *fasthttp.RequestCtx) {
 	requestcontext.Set(ctx, app.ctx)
 	handler := *app.handler.Load()
 	handler(ctx)
+	// A timeout can detach the handler's context while its worker still owns
+	// the request and response. Only inspect user values after a normal return.
+	if ctx.LastTimeoutErrorResponse() == nil {
+		armJSONBodyRecycle(ctx)
+	}
 }
 
 // applyMiddleware 应用中间件链

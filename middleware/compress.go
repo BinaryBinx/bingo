@@ -2,13 +2,16 @@ package middleware
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/gzip"
-	"github.com/valyala/fasthttp"
 	"io"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/klauspost/compress/gzip"
+	"github.com/valyala/fasthttp"
 )
+
+const largeJSONCompressionSize = 32 << 10
 
 // compressBufPool 复用压缩中间件的输出 buffer，减少 GC 压力
 var compressBufPool = sync.Pool{
@@ -108,7 +111,8 @@ func addVary(h *fasthttp.ResponseHeader, field string) {
 // compression level, a 256-byte minimum and common compressible content types.
 type CompressConfig struct {
 	// Level accepts gzip.HuffmanOnly, gzip.DefaultCompression, or 1 through 9.
-	// Zero and invalid levels fall back to gzip.DefaultCompression.
+	// Zero uses BestSpeed for JSON bodies of at least 32 KiB, and
+	// DefaultCompression otherwise. Invalid levels use DefaultCompression.
 	Level   int
 	MinSize int
 	// ContentTypes matches media types without parameters, case-insensitively.
@@ -132,6 +136,7 @@ func Compress() func(fasthttp.RequestHandler) fasthttp.RequestHandler {
 // their integrity protection. Generate such metadata outside Compress if it
 // should describe the final compressed representation.
 func CompressWithConfig(cfg CompressConfig) func(fasthttp.RequestHandler) fasthttp.RequestHandler {
+	autoLevel := cfg.Level == 0
 	if cfg.Level == 0 || cfg.Level < gzip.HuffmanOnly || cfg.Level > gzip.BestCompression {
 		cfg.Level = gzip.DefaultCompression
 	}
@@ -146,10 +151,10 @@ func CompressWithConfig(cfg CompressConfig) func(fasthttp.RequestHandler) fastht
 	for i, value := range cfg.ContentTypes {
 		cfg.ContentTypes[i] = strings.TrimSpace(value)
 	}
-	var gzipPool sync.Pool
-	gzipPool.New = func() interface{} {
-		w, _ := gzip.NewWriterLevel(io.Discard, cfg.Level)
-		return w
+	defaultPool := newGzipWriterPool(cfg.Level)
+	var largeJSONPool *sync.Pool
+	if autoLevel {
+		largeJSONPool = newGzipWriterPool(gzip.BestSpeed)
 	}
 
 	return func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
@@ -191,10 +196,15 @@ func CompressWithConfig(cfg CompressConfig) func(fasthttp.RequestHandler) fastht
 				return
 			}
 
-			if !compressibleContentType(ctx.Response.Header.ContentType(), cfg.ContentTypes) || hasCacheDirective(&ctx.Response.Header, "no-transform") {
+			contentType := ctx.Response.Header.ContentType()
+			if !compressibleContentType(contentType, cfg.ContentTypes) || hasCacheDirective(&ctx.Response.Header, "no-transform") {
 				return
 			}
 
+			gzipPool := defaultPool
+			if largeJSONPool != nil && len(body) >= largeJSONCompressionSize && jsonContentType(contentType) {
+				gzipPool = largeJSONPool
+			}
 			buf := compressBufPool.Get().(*bytes.Buffer)
 			buf.Reset()
 			w := gzipPool.Get().(*gzip.Writer)
@@ -229,6 +239,22 @@ func CompressWithConfig(cfg CompressConfig) func(fasthttp.RequestHandler) fastht
 			ctx.Response.Header.Del("Content-Length")
 		}
 	}
+}
+
+func newGzipWriterPool(level int) *sync.Pool {
+	return &sync.Pool{New: func() any {
+		writer, _ := gzip.NewWriterLevel(io.Discard, level)
+		return writer
+	}}
+}
+
+func jsonContentType(value []byte) bool {
+	mediaType, _, _ := bytes.Cut(value, []byte(";"))
+	mediaType = bytes.TrimSpace(mediaType)
+	return bytes.EqualFold(mediaType, []byte("application/json")) ||
+		(len(mediaType) > len("application/+json") &&
+			bytes.EqualFold(mediaType[:len("application/")], []byte("application/")) &&
+			bytes.EqualFold(mediaType[len(mediaType)-len("+json"):], []byte("+json")))
 }
 
 // Preserve current and legacy digest fields as well as HTTP message signatures.

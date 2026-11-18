@@ -324,29 +324,48 @@ func joinHeaderValues(values [][]byte) string {
 	return b.String()
 }
 
-// A directive name is always checked, including directives with quoted field lists.
-// Unknown extensions are ignored; ambiguous freshness values are rejected below.
-func cacheDirectives(values iter.Seq[[]byte]) map[string][]string {
-	d := make(map[string][]string)
-	for line := range values {
-		for _, part := range strings.Split(string(line), ",") {
-			name, value, _ := strings.Cut(strings.TrimSpace(part), "=")
-			name = strings.ToLower(strings.TrimSpace(name))
-			d[name] = append(d[name], strings.Trim(strings.TrimSpace(value), "\""))
+// Keep only directives used to calculate shared freshness. A repeated max-age
+// remains ambiguous unless s-maxage takes precedence.
+func cacheControlFreshness(header *fasthttp.ResponseHeader) (value string, count int, prohibited bool) {
+	var shared string
+	var sharedCount int
+	for key, line := range header.All() {
+		if !strings.EqualFold(string(key), "Cache-Control") {
+			continue
+		}
+		remaining := string(line)
+		for {
+			part, tail, more := strings.Cut(remaining, ",")
+			name, argument, _ := strings.Cut(strings.TrimSpace(part), "=")
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "private", "no-store", "no-cache":
+				return "", 0, true
+			case "max-age":
+				value = strings.Trim(strings.TrimSpace(argument), "\"")
+				count++
+			case "s-maxage":
+				shared = strings.Trim(strings.TrimSpace(argument), "\"")
+				sharedCount++
+			}
+			if !more {
+				break
+			}
+			remaining = tail
 		}
 	}
-	return d
+	if sharedCount > 0 {
+		return shared, sharedCount, false
+	}
+	return value, count, false
 }
 
 func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started, now time.Time) (time.Duration, time.Duration) {
 	if hasResponseSignature(h) || hasCachePolicyTrailer(h) || hasHeaderValue(responseHeaderValues(h, "Set-Cookie")) || hasHeaderValue(responseHeaderValues(h, "Connection")) {
 		return 0, 0
 	}
-	d := cacheDirectives(responseHeaderValues(h, "Cache-Control"))
-	for _, name := range []string{"private", "no-store", "no-cache"} {
-		if len(d[name]) > 0 {
-			return 0, 0
-		}
+	directive, count, prohibited := cacheControlFreshness(h)
+	if prohibited {
+		return 0, 0
 	}
 	age := time.Duration(0)
 	if value, count := singleResponseHeader(h, "Age"); count > 0 {
@@ -379,16 +398,12 @@ func responseFreshness(h *fasthttp.ResponseHeader, limit time.Duration, started,
 		}
 	}
 	freshness := limit
-	values, explicit := d["s-maxage"]
-	if !explicit {
-		values, explicit = d["max-age"]
-	}
-	if explicit {
-		if len(values) != 1 {
+	if count != 0 {
+		if count != 1 {
 			return 0, 0
 		}
 		var ok bool
-		freshness, ok = secondsDuration(values[0])
+		freshness, ok = secondsDuration(directive)
 		if !ok {
 			return 0, 0
 		}
