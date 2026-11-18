@@ -264,25 +264,50 @@ func writeCachedResponse(ctx *fasthttp.RequestCtx, item responseSnapshot, now ti
 }
 
 func privateCacheRequest(h *fasthttp.RequestHeader) bool {
-	private, origins := false, 0
-	// Scan once instead of ten full header lookups on every cache hit. EqualFold
-	// also supports callers that explicitly disable fasthttp header normalization.
-	h.VisitAll(func(key, value []byte) {
+	seenOrigin := false
+	for key, value := range h.All() {
+		if len(key) == 0 {
+			continue
+		}
 		name := string(key)
-		if strings.EqualFold(name, "Origin") {
-			origins++
+		first := key[0] | 0x20
+		if len(value) == 0 && first != 'o' {
+			continue
 		}
-		if private || len(value) == 0 {
-			return
-		}
-		for _, sensitive := range []string{"Authorization", "Cookie", "Cache-Control", "Pragma", "Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
-			if strings.EqualFold(name, sensitive) {
-				private = true
-				return
+		// Header names are ASCII tokens. Most application and tracing fields
+		// can be excluded by their first byte, without walking the policy list.
+		switch first {
+		case 'o':
+			if strings.EqualFold(name, "Origin") {
+				if seenOrigin {
+					return true
+				}
+				seenOrigin = true
+			}
+		case 'a':
+			if strings.EqualFold(name, "Authorization") {
+				return true
+			}
+		case 'c':
+			if strings.EqualFold(name, "Cookie") || strings.EqualFold(name, "Cache-Control") {
+				return true
+			}
+		case 'i':
+			if strings.EqualFold(name, "If-Range") || strings.EqualFold(name, "If-Match") ||
+				strings.EqualFold(name, "If-None-Match") || strings.EqualFold(name, "If-Modified-Since") || strings.EqualFold(name, "If-Unmodified-Since") {
+				return true
+			}
+		case 'p':
+			if strings.EqualFold(name, "Pragma") {
+				return true
+			}
+		case 'r':
+			if strings.EqualFold(name, "Range") {
+				return true
 			}
 		}
-	})
-	return private || origins > 1
+	}
+	return false
 }
 
 func joinHeaderValues(values [][]byte) string {

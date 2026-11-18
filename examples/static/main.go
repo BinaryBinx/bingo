@@ -13,17 +13,19 @@ import (
 func main() {
 	root := flag.String("root", "./public", "静态文件根目录（必须存在）")
 	immutable := flag.Bool("immutable", false, "仅用于内容不可变的版本化 URL，快照有效期内跳过文件检查")
+	immutablePrefix := flag.String("immutable-prefix", "", "仅对指定 URL 目录启用不可变快照，例如 /assets/build/")
 	flag.Parse()
-	if err := serve(*root, *immutable); err != nil {
+	if err := serve(*root, *immutable, *immutablePrefix); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func serve(root string, immutable bool) error {
+func serve(root string, immutable bool, immutablePrefix string) error {
 	files, err := middleware.NewStaticHandler(root, middleware.StaticConfig{
-		TTL:       time.Minute,
-		Immutable: immutable,
-		ETag:      middleware.WeakStaticETag,
+		TTL:             time.Minute,
+		Immutable:       immutable,
+		ImmutablePrefix: immutablePrefix,
+		ETag:            middleware.WeakStaticETag,
 	})
 	if err != nil {
 		return err

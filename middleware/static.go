@@ -28,6 +28,9 @@ type StaticConfig struct {
 	// immutable file in place while responses might still be reading it.
 	// It does not set a browser Cache-Control policy automatically.
 	Immutable bool
+	// ImmutablePrefix applies Immutable to one versioned URL directory within
+	// a mixed root, e.g. "/assets/build/". Other files still revalidate.
+	ImmutablePrefix string
 	// DisableRange opts out of single byte-range responses. By default GET
 	// supports closed, open-ended and suffix ranges; HEAD ignores Range.
 	DisableRange bool
@@ -47,6 +50,9 @@ type staticSnapshot struct {
 }
 
 func normalizeStaticConfig(cfg StaticConfig) StaticConfig {
+	if cfg.ImmutablePrefix != "" && !strings.HasSuffix(cfg.ImmutablePrefix, "/") {
+		cfg.ImmutablePrefix += "/"
+	}
 	if cfg.MaxEntries <= 0 {
 		cfg.MaxEntries = 1000
 	}
@@ -117,13 +123,18 @@ func serveStaticSnapshot(ctx *fasthttp.RequestCtx, item staticSnapshot, cfg Stat
 // Readers of a managed handler hold its generation lock only through this call;
 // streamed files have their own descriptor and may outlive a root reload/close.
 func serveStatic(ctx *fasthttp.RequestCtx, r *os.Root, cfg StaticConfig, cache *boundedCache[string, staticSnapshot]) bool {
-	name := path.Clean("/" + strings.ReplaceAll(string(ctx.Path()), "\\", "/"))
+	name := strings.ReplaceAll(string(ctx.Path()), "\\", "/")
+	if !strings.HasPrefix(name, "/") {
+		name = "/" + name
+	}
+	name = path.Clean(name)
 	if name == "/" {
 		name = "/index.html"
 	}
+	immutable := cfg.Immutable || (cfg.ImmutablePrefix != "" && strings.HasPrefix(name, cfg.ImmutablePrefix))
 	name = filepath.FromSlash(strings.TrimPrefix(name, "/"))
 	item, cached := cache.get(name, time.Now())
-	if cached && cfg.Immutable {
+	if cached && immutable {
 		serveStaticSnapshot(ctx, item, cfg)
 		return true
 	}
@@ -178,7 +189,7 @@ func serveStatic(ctx *fasthttp.RequestCtx, r *os.Root, cfg StaticConfig, cache *
 		}
 		return true
 	}
-	if cfg.Immutable && info.Size() > cfg.MaxEntryBytes && uint64(info.Size()) <= uint64(^uint(0)>>1) {
+	if immutable && info.Size() > cfg.MaxEntryBytes && uint64(info.Size()) <= uint64(^uint(0)>>1) {
 		// Preserve *os.File itself: fasthttp recognizes it and flushes headers
 		// before taking the OS file-to-socket path. Mutable/growing files still
 		// use an unknown length below so the complete file can be streamed.

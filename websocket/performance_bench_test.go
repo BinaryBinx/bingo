@@ -12,7 +12,7 @@ func BenchmarkPerformanceOperationContext(b *testing.B) {
 		b.Run(fmt.Sprint(broadcast), func(b *testing.B) {
 			lifetime, stop := context.WithCancel(context.Background())
 			defer stop()
-			c := &Connection{ctx: lifetime}
+			c := &Connection{ctx: lifetime, writeTimeout: 30 * time.Second}
 			parent := context.Background()
 			if broadcast {
 				var cancel context.CancelFunc
@@ -22,8 +22,13 @@ func BenchmarkPerformanceOperationContext(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				_, cancel := c.operationContext(parent, 30*time.Second)
-				cancel()
+				if broadcast {
+					c.beginBroadcast(parent)
+					c.endBroadcast()
+				} else {
+					_, cancel := c.operationContext(c.writeTimeout)
+					cancel()
+				}
 			}
 		})
 	}

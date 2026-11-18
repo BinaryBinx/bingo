@@ -40,7 +40,7 @@ Bingo 是基于 [fasthttp](https://github.com/valyala/fasthttp)、[fasthttp/rout
 
 ## 快速开始
 
-最低 Go 版本为 1.27.3，与 `go.mod` 保持一致；启用 `GOTOOLCHAIN=auto` 时会自动选择满足要求的工具链。
+最低 Go 版本为 1.27.4，与 `go.mod` 保持一致；启用 `GOTOOLCHAIN=auto` 时会自动选择满足要求的工具链。
 
 ### 1. 运行基础REST API示例
 ```bash
@@ -395,7 +395,7 @@ if err := responses.Invalidate("example.test:8080", "/items?id=1"); err != nil {
 ```go
 files, err := middleware.NewStaticHandler("./public", middleware.StaticConfig{
     TTL: time.Minute,
-    Immutable: false, // 默认检查元数据；内容带版本的 URL 可显式开启
+    ImmutablePrefix: "/assets/build/", // 此目录仅存放 URL 随内容变化的构建产物
     ETag: middleware.WeakStaticETag, // 可选：根据大小和修改时间生成弱校验器
 })
 if err != nil { log.Fatal(err) }
@@ -409,7 +409,7 @@ app.Use(files.Middleware)
 // 或 files.Reload("./releases/v2/public") 切换目录；须处理返回错误。
 ```
 
-`NewStaticHandler` 在启动时校验根目录，`Reload` 打开失败保留当前目录和缓存。Reload/Close 与请求并发安全，会释放旧快照、到期定时器和根目录句柄，已打开的响应流仍可继续读取；Close 可重复调用，关闭后的静态 GET/HEAD 返回 503。`Immutable: true` 的有效快照命中不访问文件系统，文件变更直到 TTL 到期或 Reload 后可见，仅用于内容不可变的版本化 URL；浏览器缓存策略仍由应用设置。旧 `Static` / `StaticWithConfig` API 保留每请求打开根目录的行为，无需新增关闭流程。完整生命周期示例见 `examples/static/main.go`。
+`NewStaticHandler` 在启动时校验根目录，`Reload` 打开失败保留当前目录和缓存。Reload/Close 与请求并发安全，会释放旧快照、到期定时器和根目录句柄，已打开的响应流仍可继续读取；Close 可重复调用，关闭后的静态 GET/HEAD 返回 503。`Immutable: true` 的有效快照命中不访问文件系统，文件变更直到 TTL 到期或 Reload 后可见，仅用于内容不可变的版本化 URL；浏览器缓存策略仍由应用设置。同一目录树同时提供版本化资源和可变文件时，可用 `ImmutablePrefix: "/assets/build/"` 只对该 URL 子目录启用此策略。静态示例支持 `-immutable-prefix /assets/build/`。旧 `Static` / `StaticWithConfig` API 保留每请求打开根目录的行为，无需新增关闭流程。完整生命周期示例见 `examples/static/main.go`。
 
 Immutable 大文件使用准确 Content-Length 的文件流，在支持的明文 TCP 连接上可利用 sendfile；开启后必须保证文件在发送期间不被原地修改。普通可变大文件及读取中增长到快照预算之外的文件仍使用完整流式发送。预算内文件按 Stat 大小预分配读取缓冲，减少首次读取或快照失效后的扩容与复制；仍检查文件增长、缩短和读取错误，增长超限时回到文件开头转交响应流。静态 GET/HEAD 按 `If-Match`、`If-Unmodified-Since`、`If-None-Match`、`If-Modified-Since` 的优先级处理条件，返回对应的 304/412。304/412 及 HEAD 响应不会读取正文。
 
@@ -438,7 +438,7 @@ app.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{
 
 路由组只在注册时统一前缀与子路径之间的斜杠：`Group("/api/").GET("/items", h)`、`Group("/api").GET("items", h)` 均注册 `/api/items`，嵌套 `Group` 与 `Handle` 遵循相同规则。空子路径保留组前缀，`"/"` 子路径保留末尾斜杠；内部斜杠、点段、参数正则和通配符不进行路径清理，原有路由冲突及重定向规则继续适用。
 
-`JSON` 先完成序列化，再更新状态码、类型和正文。序列化失败时返回错误，保留原响应及响应流，不读取或关闭旧流；调用方应处理返回的错误。成功后将独立的序列化缓冲移交给响应，避免二次复制，后续仍可追加正文或替换响应流。`GetParam` 按需读取路由用户值，`SetParam` 的本地覆盖优先；参数值仅应在本次请求中使用。
+`JSON` 先完成序列化，再更新状态码、类型和正文。序列化失败时返回错误，保留原响应及响应流，不读取或关闭旧流；调用方应处理返回的错误。原生 Sonic 默认编码器复用临时缓冲，容量最多保留 256 KiB。超过上限时直接将缓冲移交给响应。响应始终拥有自己的正文，后续可追加正文或替换响应流。`GetParam` 按需读取路由用户值，`SetParam` 的本地覆盖优先；参数值仅应在本次请求中使用。
 
 `BindJSON` 默认复制字符串，避免长期保存一个字段却留住整个 JSON 缓冲。确定所有解码字段仅在本次请求中使用时，可以在创建 App 前设置 `config.JSONCopyStrings = false`。`ReduceMemoryUsage` 也可在配置中按吞吐/内存目标选择。
 
@@ -465,6 +465,7 @@ go test ./middleware -run '^$' -bench '^BenchmarkStaticBodyRead$' -benchmem -cou
 go test ./middleware -run '^$' -bench '^BenchmarkPerformanceCacheHitParallel' -benchmem '-cpu=1,8,16'
 go test ./middleware -run '^$' -bench '^BenchmarkCacheEvictionAllHot$' -benchmem -benchtime=200x -count=3
 go test ./middleware -run '^$' -fuzz '^FuzzStaticRangeAndETag$' -fuzztime=30s
+go test ./websocket -run '^$' -bench '^BenchmarkBroadcastLoopback$' -benchmem -count=3
 go test -race ./...
 ```
 

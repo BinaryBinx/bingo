@@ -30,6 +30,7 @@ type boundedCache[K comparable, V any] struct {
 	maxBytes       int64
 	maxEntries     int
 	timer          *time.Timer
+	nextExpiry     time.Time // deadline currently armed under mu
 	seed           maphash.Seed
 	shards         [cacheShardCount]cacheShard[K, V]
 	// Optional intrusive index: one head per retained Host/URI, with no entries
@@ -224,14 +225,19 @@ func (c *boundedCache[K, V]) putLocked(key K, value V, cost int64, expires time.
 }
 
 func (c *boundedCache[K, V]) scheduleExpiry() {
-	if c.timer != nil {
-		c.timer.Stop()
-	}
 	if len(c.expiry) == 0 {
-		c.timer = nil
+		if c.timer != nil {
+			c.timer.Stop()
+			c.timer = nil
+		}
 		return
 	}
-	delay := time.Until(c.expiry[0].expires)
+	next := c.expiry[0].expires
+	if c.timer != nil && next.Equal(c.nextExpiry) {
+		return
+	}
+	c.nextExpiry = next
+	delay := time.Until(next)
 	if c.timer == nil {
 		c.timer = time.AfterFunc(delay, c.expire)
 	} else {
@@ -242,6 +248,8 @@ func (c *boundedCache[K, V]) scheduleExpiry() {
 func (c *boundedCache[K, V]) expire() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Re-arm even if an early or previously queued callback sees the same head.
+	c.nextExpiry = time.Time{}
 	now := time.Now()
 	for len(c.expiry) > 0 && !now.Before(c.expiry[0].expires) {
 		c.remove(c.expiry[0])

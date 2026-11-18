@@ -1,15 +1,46 @@
 package core
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"strings"
 	"testing"
 
+	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 )
 
 type failingJSONValue struct{}
+
+func TestJSONMatchesMarshalAcrossBufferSizesAndCustomConfig(t *testing.T) {
+	previous := sonic.ConfigDefault
+	defer func() { sonic.ConfigDefault = previous }()
+	for _, api := range []sonic.API{previous, sonic.Config{EscapeHTML: true}.Froze()} {
+		sonic.ConfigDefault = api
+		for _, n := range []int{16, 65536, maxJSONBuffer + 1} {
+			input := strings.Repeat("x", n) + "<>&"
+			want, err := sonic.Marshal(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &RequestContext{RequestCtx: &fasthttp.RequestCtx{}}
+			if err := c.JSON(200, input); err != nil {
+				t.Fatal(err)
+			}
+			// A subsequent encode must not overwrite an outstanding response.
+			other := &RequestContext{RequestCtx: &fasthttp.RequestCtx{}}
+			if err := other.JSON(200, strings.Repeat("y", n)); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(c.Response.Body(), want) {
+				t.Fatalf("encoding or buffer ownership changed for size %d", n)
+			}
+			c.Response.Reset()
+			other.Response.Reset()
+		}
+	}
+}
 
 func (failingJSONValue) MarshalJSON() ([]byte, error) {
 	return nil, errors.New("application serialization failed")

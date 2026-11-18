@@ -22,6 +22,8 @@ type Connection struct {
 	transport     net.Conn
 	transportMu   sync.Mutex
 	transportDone bool
+	broadcastMu   sync.Mutex
+	broadcastStop context.CancelFunc // at most one admitted broadcast per manager
 	manager       *ConnectionManager
 	id            string
 	ctx           context.Context
@@ -53,7 +55,7 @@ func (c *Connection) IsClosed() bool { return c.closed.Load() }
 func (c *Connection) touch()         { c.lastActivity.Store(time.Now().UnixNano()) }
 
 func (c *Connection) Send(value interface{}) error {
-	ctx, cancel := c.operationContext(context.Background(), c.writeTimeout)
+	ctx, cancel := c.operationContext(c.writeTimeout)
 	defer cancel()
 	if c.IsClosed() {
 		return ErrConnectionClosed
@@ -66,15 +68,15 @@ func (c *Connection) Send(value interface{}) error {
 }
 
 func (c *Connection) SendText(text string) error {
-	return c.send(context.Background(), coderws.MessageText, []byte(text))
+	return c.send(coderws.MessageText, []byte(text))
 }
 
 func (c *Connection) SendBinary(data []byte) error {
-	return c.send(context.Background(), coderws.MessageBinary, data)
+	return c.send(coderws.MessageBinary, data)
 }
 
-func (c *Connection) send(parent context.Context, kind coderws.MessageType, data []byte) error {
-	ctx, cancel := c.operationContext(parent, c.writeTimeout)
+func (c *Connection) send(kind coderws.MessageType, data []byte) error {
+	ctx, cancel := c.operationContext(c.writeTimeout)
 	defer cancel()
 	return c.write(ctx, kind, data)
 }
@@ -114,7 +116,7 @@ func (c *Connection) ReadText() (string, error) {
 func (c *Connection) ReadBinary() ([]byte, error) { return c.read() }
 
 func (c *Connection) read() ([]byte, error) {
-	ctx, cancel := c.operationContext(context.Background(), c.readTimeout)
+	ctx, cancel := c.operationContext(c.readTimeout)
 	defer cancel()
 	if err := c.acquire(ctx, c.readGate); err != nil {
 		return nil, err
@@ -149,29 +151,48 @@ func (c *Connection) acquire(ctx context.Context, lock chan struct{}) error {
 	}
 }
 
-func (c *Connection) operationContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	// Ordinary reads/writes need only the connection's own cancellation chain.
-	if parent.Done() == nil || parent == c.ctx {
-		if timeout > 0 {
-			return context.WithTimeout(c.ctx, timeout)
-		}
-		return c.ctx, noOperationCancel
+func (c *Connection) operationContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(c.ctx, timeout)
 	}
+	return c.ctx, noOperationCancel
+}
+
+// The manager's broadcast gate serializes batches, and each connection appears
+// once in a batch. Register its cancel function before waiting for the write
+// gate so Close can interrupt either a queued or an in-progress write.
+func (c *Connection) beginBroadcast(parent context.Context) context.Context {
 	var ctx context.Context
 	var cancel context.CancelFunc
-	if timeout > 0 {
-		// WithTimeout already supplies cancellation and respects earlier parent
-		// deadlines. An extra WithCancel node would duplicate both allocations
-		// and propagation work for every recipient of a broadcast.
-		ctx, cancel = context.WithTimeout(parent, timeout)
+	if c.writeTimeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, c.writeTimeout)
 	} else {
 		ctx, cancel = context.WithCancel(parent)
 	}
-	stop := context.AfterFunc(c.ctx, cancel)
+	c.broadcastMu.Lock()
+	c.broadcastStop = cancel
 	if c.ctx.Err() != nil {
 		cancel()
 	}
-	return ctx, func() { stop(); cancel() }
+	c.broadcastMu.Unlock()
+	return ctx
+}
+
+func (c *Connection) endBroadcast() {
+	c.broadcastMu.Lock()
+	stop := c.broadcastStop
+	c.broadcastStop = nil
+	c.broadcastMu.Unlock()
+	stop()
+}
+
+func (c *Connection) cancelOperations() {
+	c.cancel()
+	c.broadcastMu.Lock()
+	if c.broadcastStop != nil {
+		c.broadcastStop()
+	}
+	c.broadcastMu.Unlock()
 }
 
 func noOperationCancel() {}
@@ -188,7 +209,7 @@ func (c *Connection) CloseWithContext(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, c.forceTransportClose)
 	defer stop()
 	if c.closed.CompareAndSwap(false, true) {
-		c.cancel()
+		c.cancelOperations()
 		if ctx.Err() != nil {
 			c.forceTransportClose()
 		}
@@ -218,7 +239,7 @@ func (c *Connection) CloseNow() { _ = c.closeNow() }
 func (c *Connection) closeNow() error {
 	c.forceTransportClose()
 	if c.closed.CompareAndSwap(false, true) {
-		c.cancel()
+		c.cancelOperations()
 		var err error
 		if c.conn != nil {
 			err = c.conn.CloseNow()

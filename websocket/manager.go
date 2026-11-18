@@ -219,7 +219,9 @@ func (m *ConnectionManager) broadcast(parent context.Context, kind coderws.Messa
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return conn.send(ctx, kind, data)
+		writeCtx := conn.beginBroadcast(ctx)
+		defer conn.endBroadcast()
+		return conn.write(writeCtx, kind, data)
 	})
 }
 

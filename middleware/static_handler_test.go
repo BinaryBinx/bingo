@@ -20,6 +20,42 @@ func writeStaticFixture(t *testing.T, root, body string) {
 	}
 }
 
+func TestStaticImmutablePrefixIsScopedToDirectory(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"build", "build-old"} {
+		full := filepath.Join(root, dir)
+		if err := os.Mkdir(full, 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeStaticFixture(t, full, "first")
+	}
+	s, err := NewStaticHandler(root, StaticConfig{ImmutablePrefix: "/build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	h := s.Middleware(func(*fasthttp.RequestCtx) { t.Fatal("missing file") })
+	check := func(uri, want string) {
+		t.Helper()
+		ctx := requestContext(t, uri, nil)
+		h(ctx)
+		if got := string(ctx.Response.Body()); got != want {
+			t.Fatalf("%s: got %q, want %q", uri, got, want)
+		}
+	}
+	for _, dir := range []string{"build", "build-old"} {
+		check("/"+dir+"/asset.txt", "first")
+		writeStaticFixture(t, filepath.Join(root, dir), "changed")
+	}
+	check("/build/asset.txt", "first")
+	check("/build-old/asset.txt", "changed")
+	check("/build/../build-old/asset.txt", "changed")
+	if err := s.Reload(""); err != nil {
+		t.Fatal(err)
+	}
+	check("/build/asset.txt", "changed")
+}
+
 func TestManagedStaticReloadAndClose(t *testing.T) {
 	for _, immutable := range []bool{false, true} {
 		t.Run(fmt.Sprint(immutable), func(t *testing.T) {

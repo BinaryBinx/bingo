@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"slices"
 	"strings"
 	"sync"
@@ -41,13 +42,27 @@ func (g *responseFlights) join(base responseCacheKey, header *fasthttp.RequestHe
 }
 
 func (g *responseFlights) joinGeneration(base responseCacheKey, header *fasthttp.RequestHeader, generation uint64) (*responseFlight, bool) {
+	// Keep admission based on the complete size, even when a long key is stored
+	// as a digest. Waiters always recheck the actual Vary representation.
 	var dimensions string
+	var size int
 	if g.headers == nil {
-		dimensions = string(header.Header())
+		raw := header.Header()
+		size = len(raw)
+		if int64(size) > g.maxBytes {
+			return nil, false
+		}
+		if size >= sha256.Size {
+			sum := sha256.Sum256(raw)
+			dimensions = string(sum[:])
+		} else {
+			dimensions = string(raw)
+		}
 	} else {
 		dimensions = cacheVariant(g.headers, header)
+		size = len(dimensions)
 	}
-	cost := int64(len(dimensions) + len(base.scheme) + len(base.host) + len(base.uri) + len(base.encoding) + len(base.origin) + 288)
+	cost := int64(size + len(base.scheme) + len(base.host) + len(base.uri) + len(base.encoding) + len(base.origin) + 288)
 	if cost > g.maxBytes {
 		return nil, false
 	}

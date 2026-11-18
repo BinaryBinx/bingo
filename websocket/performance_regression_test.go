@@ -14,18 +14,20 @@ func TestOperationContextPreservesBothCancellationSources(t *testing.T) {
 		t.Run(source, func(t *testing.T) {
 			lifetime, closeConnection := context.WithCancel(context.Background())
 			defer closeConnection()
-			c := &Connection{ctx: lifetime}
+			c := &Connection{ctx: lifetime, cancel: closeConnection, writeTimeout: time.Minute}
 			parent, cancelParent := context.WithTimeout(context.Background(), time.Hour)
 			defer cancelParent()
-			operation, cancel := c.operationContext(parent, time.Minute)
-			defer cancel()
+			operation := c.beginBroadcast(parent)
 			switch source {
 			case "parent":
 				cancelParent()
 			case "connection":
-				closeConnection()
+				c.cancelOperations()
 			case "operation":
-				cancel()
+				c.endBroadcast()
+			}
+			if source != "operation" {
+				defer c.endBroadcast()
 			}
 			select {
 			case <-operation.Done():
@@ -42,11 +44,11 @@ func TestOperationContextPreservesBothCancellationSources(t *testing.T) {
 	}
 	lifetime, cancelConnection := context.WithCancel(context.Background())
 	defer cancelConnection()
-	c := &Connection{ctx: lifetime}
+	c := &Connection{ctx: lifetime, writeTimeout: time.Hour}
 	parent, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer stop()
-	operation, cancel := c.operationContext(parent, time.Hour)
-	defer cancel()
+	operation := c.beginBroadcast(parent)
+	defer c.endBroadcast()
 	parentDeadline, _ := parent.Deadline()
 	operationDeadline, _ := operation.Deadline()
 	if !parentDeadline.Equal(operationDeadline) {

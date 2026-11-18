@@ -42,17 +42,24 @@ func BenchmarkPerformanceCacheHitParallel(b *testing.B) {
 
 func BenchmarkPerformanceStaticSnapshot(b *testing.B) {
 	root := b.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "asset.txt"), []byte(strings.Repeat("x", 16<<10)), 0600); err != nil {
+	if err := os.Mkdir(filepath.Join(root, "build"), 0700); err != nil {
 		b.Fatal(err)
 	}
-	for _, mode := range []string{"legacy", "managed", "immutable"} {
+	if err := os.WriteFile(filepath.Join(root, "build", "asset.txt"), []byte(strings.Repeat("x", 16<<10)), 0600); err != nil {
+		b.Fatal(err)
+	}
+	for _, mode := range []string{"legacy", "managed", "immutable", "immutable-prefix"} {
 		b.Run(mode, func(b *testing.B) {
 			next := func(c *fasthttp.RequestCtx) { c.SetStatusCode(404) }
 			var h fasthttp.RequestHandler
 			if mode == "legacy" {
 				h = Static(root)(next)
 			} else {
-				s, err := NewStaticHandler(root, StaticConfig{Immutable: mode == "immutable"})
+				cfg := StaticConfig{Immutable: mode == "immutable"}
+				if mode == "immutable-prefix" {
+					cfg.ImmutablePrefix = "/build/"
+				}
+				s, err := NewStaticHandler(root, cfg)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -61,7 +68,7 @@ func BenchmarkPerformanceStaticSnapshot(b *testing.B) {
 			}
 			var c fasthttp.RequestCtx
 			defer c.Response.Reset()
-			c.Request.SetRequestURI("/asset.txt")
+			c.Request.SetRequestURI("/build/asset.txt")
 			h(&c)
 			if c.Response.StatusCode() != 200 || len(c.Response.Body()) != 16<<10 {
 				b.Fatal("snapshot setup failed")

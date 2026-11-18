@@ -14,14 +14,14 @@ import (
 	coderws "github.com/coder/websocket"
 )
 
-func testUpgrader(t *testing.T) *WebSocketUpgrader {
+func testUpgrader(t testing.TB) *WebSocketUpgrader {
 	t.Helper()
 	u := NewWebSocketUpgrader(nil)
 	t.Cleanup(func() { u.manager.Shutdown(context.Background()) })
 	return u
 }
 
-func testPair(t *testing.T, u *WebSocketUpgrader) (*Connection, *coderws.Conn) {
+func testPair(t testing.TB, u *WebSocketUpgrader) (*Connection, *coderws.Conn) {
 	t.Helper()
 	accepted := make(chan *Connection, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +114,37 @@ func TestOperationDeadlineIncludesLockWait(t *testing.T) {
 	<-conn.readGate
 	if !errors.Is(err, context.DeadlineExceeded) || conn.IsClosed() {
 		t.Fatalf("queued read: %v closed=%v", err, conn.IsClosed())
+	}
+}
+
+func TestCloseInterruptsBroadcastWaitingForWriteGate(t *testing.T) {
+	u := testUpgrader(t)
+	c, _ := testPair(t, u)
+	c.writeGate <- struct{}{}
+	defer func() { <-c.writeGate }()
+	done := make(chan error, 1)
+	go func() { done <- u.manager.BroadcastTextContext(context.Background(), "queued") }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.broadcastMu.Lock()
+		registered := c.broadcastStop != nil
+		c.broadcastMu.Unlock()
+		if registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("broadcast did not enter the send path")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.CloseNow()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrConnectionClosed) {
+			t.Fatalf("queued broadcast returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing the peer did not interrupt the queued broadcast")
 	}
 }
 

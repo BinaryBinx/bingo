@@ -3,11 +3,14 @@ package core
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sync"
 	"time"
 
 	"github.com/BinaryBinx/bingo/internal/requestcontext"
 	"github.com/BinaryBinx/bingo/internal/responsemeta"
 	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/encoder"
 	"github.com/valyala/fasthttp"
 )
 
@@ -119,22 +122,54 @@ func (c *RequestContext) SetParam(key, value string) {
 	c.params[key] = value
 }
 
+// EncodeInto with zero options matches the native, unmodified Sonic default.
+// Keep Marshal's exact behavior for fallback platforms and custom defaults,
+// including defaults installed by another package's init function.
+var nativeJSONDefault = func() sonic.API {
+	if sonic.APIKind == sonic.UseSonicJSON && reflect.DeepEqual(sonic.ConfigDefault, sonic.Config{}.Froze()) {
+		return sonic.ConfigDefault
+	}
+	return nil
+}()
+
+const maxJSONBuffer = 256 << 10
+
+var jsonBuffers = sync.Pool{New: func() any { return new([]byte) }}
+
 // JSON 发送JSON响应。序列化失败时返回错误，保留原状态、响应头、正文和响应流。
 func (c *RequestContext) JSON(statusCode int, data interface{}) error {
-	// 先完成序列化，避免错误时留下新状态/类型与旧正文的混合响应。
-	jsonData, err := sonic.Marshal(data)
-	if err != nil {
-		return err
+	var body []byte
+	var scratch *[]byte
+	if nativeJSONDefault != nil && sonic.ConfigDefault == nativeJSONDefault {
+		scratch = jsonBuffers.Get().(*[]byte)
+		*scratch = (*scratch)[:0]
+		defer func() {
+			if cap(*scratch) > maxJSONBuffer {
+				*scratch = nil
+			}
+			jsonBuffers.Put(scratch)
+		}()
+		if err := encoder.EncodeInto(scratch, data, 0); err != nil {
+			return err
+		}
+		body = *scratch
+	} else {
+		var err error
+		body, err = sonic.Marshal(data)
+		if err != nil {
+			return err
+		}
 	}
-
 	c.SetStatusCode(statusCode)
 	c.SetContentType("application/json")
-
-	// Marshal 返回独立拥有的切片；SwapBody 移交所有权，避免再次复制大响应，
-	// 同时保留后续 AppendBody/BodyWriter 的行为（SetBodyRaw 不支持这一点）。
-	// 先关闭旧流，避免 SwapBody 为返回旧正文而把 SSE/大文件读到 EOF。
-	_ = c.Response.CloseBodyStream()
-	c.Response.SwapBody(jsonData)
+	if scratch != nil && cap(body) <= maxJSONBuffer {
+		c.Response.SetBody(body) // copy before returning scratch to the pool
+	} else {
+		// The response owns detached/oversized bodies. Close the old stream
+		// first so SwapBody cannot read it to EOF.
+		_ = c.Response.CloseBodyStream()
+		c.Response.SwapBody(body)
+	}
 	return nil
 }
 
